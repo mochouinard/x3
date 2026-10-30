@@ -1,0 +1,47 @@
+[Unit]
+Description=Back up every router in the x3 address book
+Documentation=file:%h/src/x3/contrib/systemd/README.md
+# The timer fires early, and a laptop resuming from suspend can beat its own
+# DHCP lease to it. Without this the run would fail every router at once.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# --- the three paths to check before enabling this ------------------------
+# X3CTL       the x3ctl installed in your venv
+# X3_CDB      the address book (Addresses.cdb) that lists the fleet
+# ARCHIVE     the git repository the configs are written to (mode 0700)
+Environment=X3CTL=%h/src/x3/.venv/bin/x3ctl
+Environment=X3_CDB=%h/Addresses.cdb
+Environment=ARCHIVE=%h/router-config-archive
+
+ExecStart=/bin/sh -c '"$X3CTL" backup --cdb "$X3_CDB" --archive "$ARCHIVE" --quiet'
+
+# A fleet of a few hundred routers over WAN links is slow and entirely
+# I/O-bound. Staying out of the way costs nothing and keeps an early-morning
+# run from competing with anything else that matters.
+Nice=10
+IOSchedulingClass=idle
+
+# Long enough for a large fleet on bad links, short enough that a wedged run
+# does not overlap tomorrow's.
+TimeoutStartSec=3h
+
+# The archive holds plaintext router secrets. Give the unit as little of the
+# rest of the machine as it can do its job with.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/router-config-archive
+ReadOnlyPaths=%h/src/x3
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+LockPersonality=true
+
+# Journal lines are prefixed with this, so `journalctl --user -t x3-backup`
+# is the whole history without the surrounding unit noise.
+SyslogIdentifier=x3-backup

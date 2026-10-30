@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "x3"
+dynamic = ["version"]
+description = "Desktop client and command-line toolkit for routers managed over the Winbox protocol."
+requires-python = ">=3.12"
+license = "LicenseRef-x3-PolyForm-Strict-1.0.0-with-contributions AND Apache-2.0"
+license-files = ["LICENSE", "LICENSE.fr.md", "LICENSES/*", "THIRD-PARTY-NOTICES.md", "CONTRIBUTING.md"]
+readme = "README.md"
+authors = [{ name = "Marc O. Chouinard" }]
+classifiers = [
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+]
+dependencies = [
+    "pycryptodome>=3.20",
+    "ecdsa>=0.18",
+    # Network interface addresses for MAC connections and LAN discovery.
+    # Linux reads them from the kernel directly and does not need it.
+    "psutil>=5.9; sys_platform != 'linux'",
+]
+
+[project.optional-dependencies]
+gui = [
+    "PySide6>=6.6",
+    # VT102 emulation for the terminal window. Only the Qt renderer imports it,
+    # so the protocol library's own terminal channel stays dependency-free.
+    "pyte>=0.8",
+]
+
+[project.scripts]
+x3ctl = "x3.cli:main"
+x3cdb = "x3.proto.cdb:main"
+
+[project.gui-scripts]
+x3 = "x3.ui.app:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "x3.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["x3*"]
+
+[tool.setuptools.package-data]
+"x3.ui" = [
+    "resources/appicon.svg",
+    "resources/appicon-*.png",
+    "resources/appicon.ico",
+    "resources/icons/*.json",
+    "resources/icons/*.md",
+    "resources/icons/svg/*.svg",
+    "resources/icons/svg-mono/*.svg",
+    "i18n/*.json",
+]

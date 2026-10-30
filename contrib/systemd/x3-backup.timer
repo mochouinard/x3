@@ -1,0 +1,20 @@
+[Unit]
+Description=Nightly router configuration backup
+Documentation=file:%h/src/x3/contrib/systemd/README.md
+
+[Timer]
+# Early enough to be finished before anyone starts changing configs, late
+# enough to be after whatever else runs at midnight.
+OnCalendar=*-*-* 03:20:00
+
+# Do not hit a few hundred routers at the same second every night --
+# and if this ever runs on more than one machine, do not have them collide.
+RandomizedDelaySec=20m
+
+# Catch up after downtime. Without this a machine that was off at 03:20 simply
+# skips that night, and the gap is invisible until someone needs the config
+# that was never captured.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

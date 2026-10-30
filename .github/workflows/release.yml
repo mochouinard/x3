@@ -1,0 +1,81 @@
+name: release
+
+# A tag v<version> builds the Windows installer and the Linux AppImage and
+# publishes them, with SHA256SUMS, as a GitHub release: the feed x3 updates
+# itself from (x3/ui/updates.py). The tag must match x3.__version__.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          v=$(python3 -c 'import re; print(re.search(r"__version__ = \"([^\"]+)\"", open("x3/__init__.py").read()).group(1))')
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match x3 $v"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ".[gui]" pyinstaller
+      - run: pyinstaller --noconfirm packaging/pyinstaller/x3.spec
+      - run: iscc /DAppVersion=${{ needs.version.outputs.version }} packaging\windows\x3.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/x3-*-win64-setup.exe
+
+  linux:
+    needs: version
+    # The oldest supported runner: an AppImage runs on systems at least as new
+    # as the one it was built on.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ".[gui]" pyinstaller
+      - run: pyinstaller --noconfirm packaging/pyinstaller/x3.spec
+      - run: packaging/linux/build-appimage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/x3-*-x86_64.AppImage
+
+  publish:
+    needs: [version, windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: out
+        run: sha256sum x3-* > SHA256SUMS && cat SHA256SUMS
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" out/*
+          --repo "$GITHUB_REPOSITORY"
+          --title "x3 ${{ needs.version.outputs.version }}"
+          --generate-notes

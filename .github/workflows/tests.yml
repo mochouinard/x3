@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Not 3.10 or 3.11: PySide6 6.12 drops a reference to None, which
+        # crashes there (setStyleSheet, "deallocating None") and is harmless
+        # from 3.12, where None is never freed.
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Qt runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+      - name: Install
+        run: pip install -e ".[gui]"
+      # Tests that need a router's .jg plugin set skip here: those files are
+      # the vendor's and are not in the repository.
+      - name: Test
+        run: python tests/run.py

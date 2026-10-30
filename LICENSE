@@ -1,0 +1,101 @@
+Required Notice: Copyright (c) 2026 Marc O. Chouinard
+
+Version française : LICENSE.fr.md. Both versions have the same meaning.
+
+x3 is licensed under the PolyForm Strict License 1.0.0 below, together with
+the additional permission that follows it. Some parts of x3, and the
+libraries it runs on, are under other licenses: see "Other Licenses" at the
+end.
+
+---
+
+# PolyForm Strict License 1.0.0
+
+<https://polyformproject.org/licenses/strict/1.0.0>
+
+## Acceptance
+
+In order to get any license under these terms, you must agree to them as both strict obligations and conditions to all your licenses.
+
+## Copyright License
+
+The licensor grants you a copyright license for the software to do everything you might do with the software that would otherwise infringe the licensor's copyright in it for any permitted purpose, other than distributing the software or making changes or new works based on the software.
+
+## Patent License
+
+The licensor grants you a patent license for the software that covers patent claims the licensor can license, or becomes able to license, that you would infringe by using the software.
+
+## Noncommercial Purposes
+
+Any noncommercial purpose is a permitted purpose.
+
+## Personal Uses
+
+Personal use for research, experiment, and testing for the benefit of public knowledge, personal study, private entertainment, hobby projects, amateur pursuits, or religious observance, without any anticipated commercial application, is use for a permitted purpose.
+
+## Noncommercial Organizations
+
+Use by any charitable organization, educational institution, public research organization, public safety or health organization, environmental protection organization, or government institution is use for a permitted purpose regardless of the source of funding or obligations resulting from the funding.
+
+## Fair Use
+
+You may have "fair use" rights for the software under the law. These terms do not limit them.
+
+## No Other Rights
+
+These terms do not allow you to sublicense or transfer any of your licenses to anyone else, or prevent the licensor from granting licenses to anyone else.  These terms do not imply any other licenses.
+
+## Patent Defense
+
+If you make any written claim that the software infringes or contributes to infringement of any patent, your patent license for the software granted under these terms ends immediately. If your company makes such a claim, your patent license ends immediately for work on behalf of your company.
+
+## Violations
+
+The first time you are notified in writing that you have violated any of these terms, or done anything with the software not covered by your licenses, your licenses can nonetheless continue if you come into full compliance with these terms, and take practical steps to correct past violations, within 32 days of receiving notice.  Otherwise, all your licenses end immediately.
+
+## No Liability
+
+***As far as the law allows, the software comes as is, without any warranty or condition, and the licensor will not be liable to you for any damages arising out of these terms or the use or nature of the software, under any kind of legal claim.***
+
+## Definitions
+
+The **licensor** is the individual or entity offering these terms, and the **software** is the software the licensor makes available under these terms.
+
+**You** refers to the individual or entity agreeing to these terms.
+
+**Your company** is any legal entity, sole proprietorship, or other kind of organization that you work for, plus all organizations that have control over, are under the control of, or are under common control with that organization.  **Control** means ownership of substantially all the assets of an entity, or the power to direct its management and policies by vote, contract, or otherwise.  Control can be direct or indirect.
+
+**Your licenses** are all the licenses granted to you for the software under these terms.
+
+**Use** means anything you do with the software requiring one of your licenses.
+
+---
+
+# Additional Permission: Contributions
+
+In addition to the licenses above, the licensor grants you a copyright
+license to make changes to the software, and to use your changed version,
+for the sole purpose of preparing, testing, and submitting those changes to
+the licensor for inclusion in the software: as a pull request to the official
+x3 repository, or by another means the licensor accepts. You may make your
+changed version available to others only as part of that submission (for
+example, in the fork a code-hosting service creates for a pull request).
+
+This permission is for noncommercial purposes only. It does not allow you to
+distribute changed versions in any other way, or to use them for anything
+other than preparing and testing your contribution. Contributions are
+accepted on the terms in CONTRIBUTING.md.
+
+# Other Licenses
+
+Portions of `x3/proto/crypto.py` are derived from Margin Research's
+`mikrotik_authentication` (https://github.com/MarginResearch/mikrotik_authentication)
+and remain available under the Apache License, Version 2.0, whose text is in
+`LICENSES/Apache-2.0.txt`.
+
+The libraries x3 runs on (Qt, PySide6, shiboken6, pyte, wcwidth,
+PyCryptodome, python-ecdsa, six and psutil) are not part of the software.
+Each is under its own license, listed in `THIRD-PARTY-NOTICES.md`. Nothing in
+these terms restricts your rights under those licenses, including your right
+under the GNU LGPL to replace or modify the LGPL libraries used with x3, and
+to reverse engineer x3 as far as needed to debug such changes.

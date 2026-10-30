@@ -1,0 +1,31 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# A router's .jg plugin set, as `x3ctl mirror` saves it (<version>-<build>/).
+# These files are the router vendor's, not ours: keep them local. The tests
+# that need one look for it at the repository root and skip without it.
+# No trailing slash: the set is often a symlink, which git treats as a file.
+/[0-9]*.[0-9]*-[0-9]*
+/mirror
+
+# Never commit captures or address books: the protocol carries passwords in
+# the clear inside the encrypted session, and an address book stores them.
+*.pcap
+*.m2
+*.cdb
+*.wba
+# Nor router backups, exports or logs: a .backup holds the router's users and
+# keys, an export taken with show-sensitive its secrets, and a session log
+# what was typed.
+*.backup
+*.rsc
+*.log

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- x3 — "x cubed": the box IS the exponent. Oblique box, front face carries x^3 -->
+  <!-- top face -->
+  <polygon points="4,14 14,4 60,4 50,14" fill="#60a5fa"/>
+  <!-- right face -->
+  <polygon points="50,14 60,4 60,50 50,60" fill="#1d4ed8"/>
+  <!-- front face -->
+  <rect x="4" y="14" width="46" height="46" fill="#2563eb"/>
+  <!-- lowercase x, two strokes -->
+  <g stroke="#ffffff" stroke-width="9" stroke-linecap="round" fill="none">
+    <path d="M13,30 L32,49"/>
+    <path d="M32,30 L13,49"/>
+  </g>
+  <!-- superscript 3 -->
+  <path d="M37.5,21 L43,21 Q47,21 47,24.4 Q47,27.5 43.4,27.8 Q47,28.1 47,31.2 Q47,34.6 43,34.6 L37.5,34.6"
+        fill="none" stroke="#ffffff" stroke-width="4.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
