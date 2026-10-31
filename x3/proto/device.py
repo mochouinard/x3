@@ -1993,20 +1993,18 @@ class DeviceClient:
         self._lookup_read_at.clear()
 
     def _getall_rows(
-        self, path: tuple[int, ...], reply: m.Message
+        self, path: tuple[int, ...], reply: m.Message, *, quiet: bool = False
     ) -> list[RowObject]:
-        """The objects a GETALL reply carries, as rows.
+        """The objects of a GETALL whose first reply is ``reply``, as rows,
+        the device's later pages included.
 
         Not ``_rows_from_reply``: that name is taken by the query-poll reader
         a few hundred lines up, which takes a menu rather than a path and
         reads a different reply shape.
         """
-        objs = reply.find(STD_OBJS)
-        items = objs[1] if objs and isinstance(objs[1], list) else []
         return [
             self._row_from_msg(path, it)
-            for it in items
-            if isinstance(it, m.Message)
+            for it in self._getall_pages(path, reply, quiet=quiet)
         ]
 
     def _enum_from_rows(
@@ -2253,7 +2251,7 @@ class DeviceClient:
             # click of the same dropdown.
             self._enum_read_at[p] = time.monotonic()
             return False
-        rows = self._getall_rows(p, reply)
+        rows = self._getall_rows(p, reply, quiet=True)
         self._enum_rows[p] = rows
         self._enum_cache[p] = self._enum_from_rows(p, rows)
         self._enum_marks_cache.pop(p, None)
@@ -2619,8 +2617,12 @@ class DeviceClient:
         path: tuple[int, ...],
         *,
         filter_mask: int | None = None,
+        limit: int | None = None,
     ) -> list[RowObject]:
         """GETALL (0xFE0004). Falls back to GET when the handler is not a list.
+
+        Long lists come in pages and every page is read (see ``_getall_pages``);
+        ``limit`` stops after that many rows.
 
         ``filter_mask`` is the Winbox field mask (0xfe000c). For Interface
         traffic columns use ``FILTER_IFACE_TRAFFIC`` / ``FILTER_IFACE_TRAFFIC_FULL``.
@@ -2643,14 +2645,61 @@ class DeviceClient:
                 except DeviceError:
                     raise e from None
             raise
-        objs = reply.find(STD_OBJS)
-        items = objs[1] if objs and isinstance(objs[1], list) else []
-        rows: list[RowObject] = []
-        for item in items:
-            if not isinstance(item, m.Message):
-                continue
-            rows.append(self._row_from_msg(path, item))
-        return rows
+        items = self._getall_pages(path, reply, extra=add_filter, limit=limit)
+        return [self._row_from_msg(path, item) for item in items]
+
+    #: Pages one list read may follow. A page is ~20-30 rows, so this is far
+    #: past any `maxobjs` cap; it only bounds a device that never says "last".
+    GETALL_MAX_PAGES = 2000
+
+    def _getall_pages(
+        self,
+        path: tuple[int, ...],
+        reply: m.Message,
+        *,
+        extra: Callable[[m.Message], None] | None = None,
+        limit: int | None = None,
+        quiet: bool = False,
+    ) -> list[m.Message]:
+        """Every object of a GETALL, following the device's pages.
+
+        RouterOS answers a long list one page at a time: the reply carries
+        ~20-30 objects, the total in 0xfe0019, and in 0xfe0003 the id of the
+        object the next page starts at. Sending that id back in 0xfe0003 on
+        another GETALL gets the next page; the last page has no 0xfe0003.
+        Reading only the first reply left NAT and firewall lists at ~21 rows
+        (seen on 7.19.4: 72 NAT rules came back as 22 + 21 + 29).
+
+        ``limit`` stops paging once that many objects are in hand (the
+        `maxobjs` cap of Connections and All Routes). ``last_getall_total``
+        keeps the device's own count, and ``last_getall_partial`` says
+        whether the read stopped before the device's last page.
+        """
+        total = reply.get_u32(STD_OBJ_COUNT)
+        self.last_getall_total = total
+        self.last_getall_partial = False
+        items: list[m.Message] = []
+        seen: set[int] = set()
+        while True:
+            objs = reply.find(STD_OBJS)
+            page = [it for it in (objs[1] if objs and isinstance(objs[1], list) else [])
+                    if isinstance(it, m.Message)]
+            items.extend(page)
+            cursor = reply.get_u32(QUERY_CURSOR)
+            if cursor is None:
+                return items
+            if (not page or cursor in seen or len(seen) >= self.GETALL_MAX_PAGES
+                    or (limit is not None and len(items) > limit)):
+                self.last_getall_partial = True
+                return items
+            seen.add(cursor)
+
+            def add(msg: m.Message, c: int = cursor) -> None:
+                if extra is not None:
+                    extra(msg)
+                msg.add_u32(QUERY_CURSOR, c & 0xFFFFFFFF)
+
+            reply = self._request(path, CMD_GETALL, extra=add, quiet=quiet)
 
     def get(
         self,
@@ -3528,10 +3577,10 @@ class DeviceClient:
         def _rows(path, reply):
             if isinstance(reply, BaseException) or reply is None:
                 return []
-            objs = reply.find(STD_OBJS)
-            items = objs[1] if objs and isinstance(objs[1], list) else []
-            return [self._row_from_msg(path, it) for it in items
-                    if isinstance(it, m.Message)]
+            try:
+                return self._getall_rows(path, reply, quiet=True)
+            except DeviceError:
+                return []
 
         if not isinstance(rb_msg, BaseException) and rb_msg is not None:
             try:  # board serial + model (absent on x86 VMs)
@@ -3713,19 +3762,31 @@ class DeviceClient:
                         self.enum_map(fld.enum_path)
                     except DeviceError:
                         pass
-        objs = self.getall(path, filter_mask=list_read_mask(menu))
+        # `maxobjs`: All Routes, Connections and the proxy cache stop at 10000
+        # rows rather than trying to draw a router's whole table. Paging stops
+        # there too, unless a type filter still has rows to drop.
+        cap = getattr(menu, "max_objects", None) if menu is not None else None
+        if not (isinstance(cap, int) and cap > 0):
+            cap = None
+        objs = self.getall(path, filter_mask=list_read_mask(menu),
+                           limit=cap if keep is None else None)
+        total = getattr(self, "last_getall_total", None)
+        partial = bool(getattr(self, "last_getall_partial", False))
         if keep is not None:
             objs = [o for o in objs if sch.wire_type_value(o, menu) in keep]
-        # `maxobjs`: All Routes, Connections and the proxy cache stop at 10000
-        # rows rather than trying to draw a router's whole table.
-        cap = getattr(menu, "max_objects", None) if menu is not None else None
         self._last_truncated = None
-        if isinstance(cap, int) and cap > 0 and len(objs) > cap:
+        if cap is not None and len(objs) > cap:
             self._last_truncated = (
                 getattr(menu, "max_objects_message", None)
-                or f"Showing the first {cap} of {len(objs)} rows."
+                or f"Showing the first {cap} of {total or len(objs)} rows."
             )
             objs = objs[:cap]
+        elif partial:
+            # The device kept saying "more" past what we would follow.
+            self._last_truncated = (
+                f"Showing {len(objs)} of {total} rows." if total
+                else f"Showing the first {len(objs)} rows."
+            )
         if menu is None:
             cols: list[str] = []
             if objs:

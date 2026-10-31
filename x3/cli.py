@@ -1099,6 +1099,46 @@ def _resolve_schema(args, sess=None) -> sch.Schema:
         raise WinboxError(f"downloaded no usable .jg files for {version}-{build_id}: {e}")
 
 
+def _getall_items(sess, path, max_pages: int = 2000) -> tuple[list, int, str | None]:
+    """Every object of a GETALL on a bare session: (objects, device count, error).
+
+    RouterOS sends a long list in pages: 0xfe0003 in a reply is the id the next
+    page starts at, echoed back on the next GETALL; the last page has none.
+    Same rule as DeviceClient._getall_pages.
+    """
+    items: list = []
+    count = 0
+    cursor = None
+    seen: set[int] = set()
+    while True:
+        req = (
+            m.Message()
+            .add_u32_array(m.SYS_TO, list(path))
+            .add_u32_array(m.SYS_FROM, list(DEFAULT_FROM))
+            .set_command(0xFE0004)
+            .set_request_id(sess.next_request_id())
+            .set_reply_expected(True)
+        )
+        if cursor is not None:
+            req.add_u32(0xFE0003, cursor)
+        sess.stamp_client_ident(req)
+        reply = sess.request(req)
+        if reply.has_error():
+            return items, count, reply.error_string() or "request failed"
+        hit = reply.find(0xFE0019)
+        if hit and cursor is None:
+            count = hit[1]
+        objs = reply.find(0xFE0002)
+        page = [x for x in (objs[1] if objs and isinstance(objs[1], list) else [])
+                if isinstance(x, m.Message)]
+        items.extend(page)
+        nxt = reply.find(0xFE0003)
+        if not nxt or not page or nxt[1] in seen or len(seen) >= max_pages:
+            return items, count, None
+        cursor = nxt[1]
+        seen.add(cursor)
+
+
 class _EnumResolver:
     """Names dynamic-enum ids by GETALL-ing the handler the schema points at.
 
@@ -1118,20 +1158,9 @@ class _EnumResolver:
             return self._cache[path]
         self._cache[path] = {}
         try:
-            req = (
-                m.Message()
-                .add_u32_array(m.SYS_TO, list(path))
-                .add_u32_array(m.SYS_FROM, list(DEFAULT_FROM))
-                .set_command(0xFE0004)
-                .set_request_id(self._sess.next_request_id())
-                .set_reply_expected(True)
-            )
-            self._sess.stamp_client_ident(req)
-            reply = self._sess.request(req)
-            if reply.has_error():
+            items, _count, err = _getall_items(self._sess, path)
+            if err is not None:
                 return self._cache[path]
-            hit = reply.find(0xFE0002)
-            items = hit[1] if hit and isinstance(hit[1], list) else []
             self._cache[path] = sch.enum_map_from_objects(
                 self._schema.record(path),
                 [x for x in items if isinstance(x, m.Message)],
@@ -1222,24 +1251,10 @@ def _cmd_getall(args) -> int:
     with _modern_session(args) as sess:
         sess.authenticate(user, password)
         schema = _resolve_schema(args, sess) if args.decode else None
-        msg = (
-            m.Message()
-            .add_u32_array(m.SYS_TO, to_path)
-            .add_u32_array(m.SYS_FROM, list(DEFAULT_FROM))
-            .set_command(0xFE0004)
-            .set_request_id(sess.next_request_id())
-            .set_reply_expected(True)
-        )
-        sess.stamp_client_ident(msg)
-
-        reply = sess.request(msg)
-        if reply.has_error():
-            print(f"server error: {reply.error_string()}", file=sys.stderr)
+        items, count, err = _getall_items(sess, to_path)
+        if err is not None:
+            print(f"server error: {err}", file=sys.stderr)
             return 2
-        objs = reply.find(0xFE0002)
-        count_field = reply.find(0xFE0019)
-        count = count_field[1] if count_field else 0
-        items = objs[1] if objs and isinstance(objs[1], list) else []
         enum_resolver = _EnumResolver(sess, schema) if schema is not None else None
         print(f"# {len(items)} object(s) (server count={count})")
         for i, item in enumerate(items):
