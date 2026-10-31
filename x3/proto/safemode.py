@@ -46,6 +46,13 @@ CMD_RELEASE = CMD_BIT | 5
 #: The safe-mode session id: assigned by the device on take, echoed on release.
 SESSION_ID = 0xFE0001
 
+#: System > History rows (handler [17] GETALL): field 0x4 is the row's state.
+#: 2 is "floating undo" (flag F): a change made while Safe Mode is held, by
+#: anyone -- the CRUD path, the console, another login -- and exactly what the
+#: router unrolls if the Safe Mode session drops. Verified on CHR 7.23.3.
+HISTORY_STATE = 0x4
+STATE_FLOATING = 2
+
 #: How many undo steps :meth:`SafeModeChannel.unroll` will take before giving
 #: up. A safe-mode buffer is a hand-made edit session, not a script run, so a
 #: run this long means undo has stopped making progress.
@@ -91,9 +98,14 @@ class SafeModeChannel:
         request: Callable[..., Any],
         *,
         from_path: tuple[int, ...] | None = None,
+        floating: Callable[[], int | None] | None = None,
     ) -> None:
         self._request = request
         self.from_path = from_path
+        #: Reads how many changes the router itself holds under Safe Mode
+        #: (System > History rows flagged F). None, or a None answer, falls
+        #: back to the client-side count below.
+        self._floating = floating
         #: Assigned by the device on take; echoed back on release.
         self.session_id: int | None = None
         #: Net undo depth, so unroll() knows when it has wound back to empty.
@@ -161,7 +173,16 @@ class SafeModeChannel:
         reports itself (see DeviceClient._note_safe_mode_change). Zero means
         there is nothing for keep-or-unroll to decide.
         """
-        return max(0, self._depth)
+        n = self._router_floating()
+        return n if n is not None else max(0, self._depth)
+
+    def _router_floating(self) -> int | None:
+        if self._floating is None or self.session_id is None:
+            return None
+        try:
+            return self._floating()
+        except Exception:  # noqa: BLE001  a failed read falls back to the count
+            return None
 
     def note_change(self, n: int = 1) -> None:
         """Record that ``n`` reversible changes were written.
@@ -189,17 +210,31 @@ class SafeModeChannel:
         return self.status()
 
     def unroll(self) -> SafeModeStatus:
-        """Undo every change we know about, then exit.
+        """Undo every change Safe Mode holds, then exit.
 
         There is no discard-on-exit verb: winding the buffer back to empty and
         then releasing is what "leave without keeping" means here.
+
+        How far to wind back comes from the router (History rows flagged F)
+        when it can be read. Counting only our own writes is not enough: undo
+        is router-wide and newest-first, and Safe Mode also holds changes typed
+        at the console or made by another login. With one CRUD add and then
+        one console add, a count of 1 undid the console add and kept ours.
         """
         if self.session_id is None:
             return self.status()
         steps = 0
-        while self._depth > 0 and steps < MAX_UNROLL_STEPS:
-            self.undo()
-            steps += 1
+        n = self._router_floating()
+        if n is None:
+            while self._depth > 0 and steps < MAX_UNROLL_STEPS:
+                self.undo()
+                steps += 1
+            return self.release()
+        while n > 0 and steps < MAX_UNROLL_STEPS:
+            for _ in range(n):
+                self.undo()
+                steps += 1
+            n = self._router_floating() or 0
         return self.release()
 
     def toggle(self) -> SafeModeStatus:

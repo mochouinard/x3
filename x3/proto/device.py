@@ -3416,9 +3416,25 @@ class DeviceClient:
             # every other menu: same transcript, same error envelope. (_lock is
             # an RLock, so the callers below may hold it across this.)
             self._safe_mode = SafeModeChannel(
-                self._request, from_path=self.alloc_from()
+                self._request, from_path=self.alloc_from(),
+                floating=self._safe_mode_floating,
             )
         return self._safe_mode
+
+    def _safe_mode_floating(self) -> int | None:
+        """Changes the router holds under Safe Mode: History rows flagged F.
+
+        Whoever made them -- this session's writes, ``run_console``, another
+        login -- these are what a dropped session rolls back, so they are what
+        "pending" and "discard" have to mean.
+        """
+        from .safemode import HISTORY_STATE, SAFE_MODE_PATH, STATE_FLOATING
+
+        try:
+            rows = self.getall(SAFE_MODE_PATH)
+        except DeviceError:
+            return None
+        return sum(1 for r in rows if r.values_by_code.get(HISTORY_STATE) == STATE_FLOATING)
 
     def safe_mode_status(self):
         """Query Safe Mode state (enabled/current/owner)."""
