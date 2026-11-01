@@ -3517,8 +3517,11 @@ class DeviceClient:
         if reply.has_error():
             raise DeviceError(reply.error_string() or ("undo" if undo else "redo") + " failed")
 
-    def safe_mode_pending(self) -> int:
-        """Changes written under the Safe Mode this session holds, if any."""
+    def safe_mode_pending(self) -> int | None:
+        """Changes the Safe Mode this session holds would undo, if any.
+
+        ``None`` when the router's history could not be read: unknown, not zero.
+        """
         ch = self._safe_mode
         return ch.pending if ch is not None and ch.session_id is not None else 0
 

@@ -1640,9 +1640,9 @@ class MainWindow(QMainWindow):
         else:
             if not self._safe_mode_on:
                 return
-            # Nothing written under Safe Mode, nothing to keep or unroll: leave
-            # without asking. Every config write counts itself (device.py,
-            # _note_safe_mode_change), so zero is a fact here, not a guess.
+            # Nothing held under Safe Mode, nothing to keep or unroll: leave
+            # without asking. The count is the router's own (History rows
+            # flagged F); None means it could not be read, so ask.
             pending = getattr(self.client, "safe_mode_pending", lambda: None)()
             if pending == 0:
                 self.statusBar().showMessage("Leaving Safe Mode (no changes)…")

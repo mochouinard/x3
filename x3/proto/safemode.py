@@ -166,23 +166,32 @@ class SafeModeChannel:
         self._depth += 1
 
     @property
-    def pending(self) -> int:
-        """Changes this session wrote under Safe Mode and has not undone.
+    def pending(self) -> int | None:
+        """Changes Safe Mode holds that a drop or a discard would undo.
 
-        Counted here, since the handler never says: every config write path
-        reports itself (see DeviceClient._note_safe_mode_change). Zero means
-        there is nothing for keep-or-unroll to decide.
+        Read from the router (History rows flagged F), since those include
+        console changes and other logins. ``None`` means the router could not
+        be read: the caller must not take that for zero. Only a channel built
+        without a reader falls back to counting our own writes.
         """
-        n = self._router_floating()
-        return n if n is not None else max(0, self._depth)
-
-    def _router_floating(self) -> int | None:
-        if self._floating is None or self.session_id is None:
-            return None
+        if self.session_id is None:
+            return 0
+        if self._floating is None:
+            return max(0, self._depth)
         try:
-            return self._floating()
-        except Exception:  # noqa: BLE001  a failed read falls back to the count
+            return self._read_floating()
+        except SafeModeError:
             return None
+
+    def _read_floating(self) -> int:
+        """The router's count of F rows. Raises when it cannot be read."""
+        try:
+            n = self._floating()
+        except Exception as e:  # noqa: BLE001  any failure is "unknown"
+            raise SafeModeError(f"cannot read System > History: {e}") from e
+        if n is None:
+            raise SafeModeError("cannot read System > History")
+        return int(n)
 
     def note_change(self, n: int = 1) -> None:
         """Record that ``n`` reversible changes were written.
@@ -215,26 +224,42 @@ class SafeModeChannel:
         There is no discard-on-exit verb: winding the buffer back to empty and
         then releasing is what "leave without keeping" means here.
 
-        How far to wind back comes from the router (History rows flagged F)
-        when it can be read. Counting only our own writes is not enough: undo
-        is router-wide and newest-first, and Safe Mode also holds changes typed
-        at the console or made by another login. With one CRUD add and then
-        one console add, a count of 1 undid the console add and kept ours.
+        How far to wind back comes from the router (History rows flagged F).
+        Counting only our own writes is not enough: undo is router-wide and
+        newest-first, and Safe Mode also holds changes typed at the console or
+        made by another login. With one CRUD add and then one console add, a
+        count of 1 undid the console add and kept ours.
+
+        If the router cannot be read, or undo stops making progress, this
+        raises and leaves Safe Mode held: whatever is still floating stays
+        reversible, by another try or by dropping the session. Releasing then
+        would keep changes the caller asked to discard, without saying so.
         """
         if self.session_id is None:
             return self.status()
-        steps = 0
-        n = self._router_floating()
-        if n is None:
+        if self._floating is None:
+            steps = 0
             while self._depth > 0 and steps < MAX_UNROLL_STEPS:
                 self.undo()
                 steps += 1
             return self.release()
-        while n > 0 and steps < MAX_UNROLL_STEPS:
+        n = self._read_floating()
+        steps = 0
+        while n > 0:
             for _ in range(n):
+                if steps >= MAX_UNROLL_STEPS:
+                    raise SafeModeError(
+                        f"unroll stopped after {steps} undo steps with changes "
+                        "still pending; Safe Mode is still on"
+                    )
                 self.undo()
                 steps += 1
-            n = self._router_floating() or 0
+            try:
+                n = self._read_floating()
+            except SafeModeError as e:
+                raise SafeModeError(
+                    f"{e} after {steps} undo steps; Safe Mode is still on"
+                ) from e
         return self.release()
 
     def toggle(self) -> SafeModeStatus:

@@ -65,13 +65,60 @@ ch.undo = undo_and_race
 ch.unroll()
 check("recounts after the first pass", (n[0], sent.count(CMD_UNDO)), (0, 2))
 
-# The router can't be read: fall back to our own count.
+# The router can't be read: pending is unknown, and unroll refuses, still held.
+from x3.proto.safemode import MAX_UNROLL_STEPS, SafeModeError
+
 ch, sent = channel([0])
 ch._floating = lambda: None
 ch.take()
 ch.note_change(3)
-check("fallback pending", ch.pending, 3)
+check("unreadable pending is None, not our count", ch.pending, None)
+try:
+    ch.unroll()
+    check("unroll refuses", "returned", "raised")
+except SafeModeError:
+    check("unroll refuses", "raised", "raised")
+check("no undo, no release", sent[1:], [])
+check("still held", ch.session_id, 7)
+
+# The recount fails part way: stop, keep Safe Mode held.
+n = [2]
+ch, sent = channel(n)
+ch.take()
+reads = [0]
+def flaky():
+    reads[0] += 1
+    if reads[0] > 1:
+        raise OSError("link down")
+    return n[0]
+ch._floating = flaky
+try:
+    ch.unroll()
+    check("mid-way failure raises", "returned", "raised")
+except SafeModeError:
+    check("mid-way failure raises", "raised", "raised")
+check("undid what it read, no release", sent[1:], [CMD_UNDO, CMD_UNDO])
+check("still held after failure", ch.session_id, 7)
+
+# The step cap holds inside one pass.
+n = [MAX_UNROLL_STEPS + 50]
+ch, sent = channel(n)
+ch.take()
+try:
+    ch.unroll()
+    check("cap raises", "returned", "raised")
+except SafeModeError:
+    check("cap raises", "raised", "raised")
+check("never more undos than the cap", sent.count(CMD_UNDO), MAX_UNROLL_STEPS)
+check("no release at the cap", CMD_RELEASE in sent, False)
+
+# No reader at all (a bare channel): our own count is all there is.
+ch, sent = channel([0])
+ch._floating = None
+ch.take()
+ch.note_change(3)
+check("readerless pending", ch.pending, 3)
 ch.unroll()
-check("fallback undoes our count", sent.count(CMD_UNDO), 3)
+check("readerless unroll undoes our count", sent.count(CMD_UNDO), 3)
 
 sys.exit(1 if FAILS else 0)
