@@ -175,6 +175,14 @@ on are undone by the router if the session drops. While it is armed the whole
 window says so: a striped toolbar button, a banner and a hazard-striped
 backdrop. An armed session left idle starts asking to be dealt with.
 
+Safe Mode covers the router, not only x3. Every change made while it is held
+is undone if the session drops: list and form edits, commands typed in the
+console window, and changes made at the same time from another login. The
+router marks them `F` in **System ▸ History**. x3 reads that list for its
+pending count, and leaving without keeping undoes all of them. Avoid working
+on the router from a second session while Safe Mode is on, because its changes
+will be undone too.
+
 ### Keyboard
 
 **In a list window**
