@@ -539,6 +539,94 @@ check("interface_traffic types the device's own spelling, quoted, once",
       cc.typed, ['/interface monitor-traffic "bridge-lan" once'])
 
 
+# --- console_print -----------------------------------------------------------
+
+cc = ConsoleClient("0 peer=upstream-1 prefix=203.0.113.0/24 nexthop=1.2.3.4")
+out = on(cc).console_print({"device": "x", "menu": "BGP/Advertisements",
+                            "where": ["peer = upstream-1", "prefix=203.0.113.0/24"]})
+check("console_print types one print, terse, with the where rebuilt",
+      cc.typed, ["/routing bgp advertisements print terse without-paging "
+                 "where peer=upstream-1 and prefix=203.0.113.0/24"])
+check("and returns the rows under it", out.splitlines()[1:],
+      ["0 peer=upstream-1 prefix=203.0.113.0/24 nexthop=1.2.3.4"])
+check("every condition shape",
+      [diag.condition(c) for c in ["dst-address in 203.0.113.7/24", "8.8.8.8 in dst-address",
+                                   "active", "! disabled", "comment='site a'",
+                                   "routing-table!=main"]],
+      ["dst-address in 203.0.113.0/24", "8.8.8.8/32 in dst-address", "active",
+       "!disabled", 'comment="site a"', "routing-table!=main"])
+check("count_only and detail",
+      [diag.print_command("/ip route", [], count_only=True),
+       diag.print_command("/ip route", ["active"], detail=True)],
+      ["/ip route print count-only without-paging",
+       "/ip route print detail without-paging where active"])
+for bad_menu in ["/file remove", "/system script run", "/user", "/ppp secret",
+                 "/ip ipsec installed-sa", "route"]:
+    cc = ConsoleClient("")
+    try:
+        on(cc).console_print({"device": "x", "menu": bad_menu})
+        ok(f"console_print refuses menu {bad_menu!r}", False)
+    except ToolError:
+        ok(f"console_print refuses menu {bad_menu!r}", cc.typed == [])
+for bad in ['comment=$x', 'comment=[/system reboot]', 'name="a" or 1', 'name=a\\b',
+            'x=a"b', 'name=?', 'dst-address in [:put 1]', 'a=b; /system reboot',
+            '1.2.3.4 in 5.6.7.8', 'peer=x\r/system reboot', 'peer=x and disabled=yes']:
+    cc = ConsoleClient("")
+    try:
+        on(cc).console_print({"device": "x", "menu": "ip route", "where": [bad]})
+        ok(f"console_print refuses where {bad!r}", False, cc.typed)
+    except ToolError:
+        ok(f"console_print refuses where {bad!r}", cc.typed == [])
+cc = ConsoleClient("")
+out = on(cc).console_print({"device": "x", "menu": "bgp advertisements", "where": ["peer=a"]})
+ok("an empty advertisements list says why it may be empty",
+   "keep-sent-attributes" in out and "field name" in out)
+cc = ConsoleClient("\n".join(f"{i} dst-address=10.0.{i}.0/24" for i in range(30)))
+out = on(cc).console_print({"device": "x", "menu": "routing route", "limit": 5})
+check("a long print is cut to the limit, and says so",
+      out.splitlines()[1:3], ["# first 5 of 30 lines", "0 dst-address=10.0.0.0/24"])
+
+
+# --- link and health -----------------------------------------------------------
+
+cc = ConsoleClient("name: ether1\n status: link-ok")
+on(cc).ethernet_monitor({"device": "x", "interface": "ETHER1"})
+check("ethernet_monitor types the device's spelling, quoted, once",
+      cc.typed, ['/interface ethernet monitor "ether1" once'])
+cc = ConsoleClient("")
+try:
+    on(cc).ethernet_monitor({"device": "x", "interface": "ether9"})
+    ok("ethernet_monitor refuses an interface the device lacks", False)
+except ToolError:
+    ok("ethernet_monitor refuses an interface the device lacks", cc.typed == [])
+screens = "\n".join([
+    "Columns: SRC-ADDRESS, TX", "SRC  TX", "10.0.0.1  1kbps",
+    "Columns: SRC-ADDRESS, TX", "SRC  TX", "10.0.0.2  9kbps",
+    "-- [Q quit|D dump|C-z pause]",
+])
+cc = ConsoleClient(screens)
+out = on(cc).torch({"device": "x", "interface": "ether1", "seconds": 4,
+                    "src_address": "10.0.0.0/8", "port": 443})
+check("torch types one built command",
+      cc.typed, ['/tool torch interface="ether1" duration=4s src-address=10.0.0.0/8 port=443'])
+check("and keeps only its last screen, without the key hint",
+      out.splitlines()[1:], ["Columns: SRC-ADDRESS, TX", "SRC  TX", "10.0.0.2  9kbps"])
+for bad in [{"src_address": "10.0.0.1 port=1"}, {"seconds": 60}, {"port": "22;x"}]:
+    cc = ConsoleClient("")
+    try:
+        on(cc).torch({"device": "x", "interface": "ether1", **bad})
+        ok(f"torch refuses {bad}", False)
+    except ToolError:
+        ok(f"torch refuses {bad}", cc.typed == [])
+cc = ConsoleClient("temperature: 41C")
+on(cc).system_health({"device": "x"})
+check("system_health types its fixed command", cc.typed, ["/system health print without-paging"])
+cc = ConsoleClient("0 R ether1 1 2")
+on(cc).console_print({"device": "x", "menu": "interface", "stats": True, "where": ["name=ether1"]})
+check("console_print stats prints the counters view",
+      cc.typed, ["/interface print stats without-paging where name=ether1"])
+
+
 print()
 if failures:
     print(f"{len(failures)} failure(s)")

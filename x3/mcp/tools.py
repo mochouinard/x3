@@ -33,8 +33,11 @@ INSTRUCTIONS = (
     "x3 reads routers over the Winbox protocol, using the user's "
     "saved x3 address book. Start with list_devices; name a device by what it "
     "lists. list_menus shows what a device offers; read_menu reads one. "
-    "ping, traceroute, read_log and interface_traffic run from the router "
-    "itself. Everything is read-only: this server cannot change a router. "
+    "ping, traceroute, read_log, interface_traffic, ethernet_monitor, torch "
+    "and system_health run from the router "
+    "itself; console_print prints what Winbox has no menu for, such as BGP "
+    "advertisements, or one prefix out of a large routing table. "
+    "Everything is read-only: this server cannot change a router. "
     "Secrets come back as <hidden>."
 )
 
@@ -484,6 +487,96 @@ class ToolBox:
                 }, "required": ["device", "interface"]},
                 "annotations": ro,
             }, self.interface_traffic),
+            ({
+                "name": "console_print",
+                "description": "A read-only 'print' at the router's console, "
+                               "for what Winbox has no menu for or what needs "
+                               "a filter on the router side: BGP "
+                               "advertisements per peer, one prefix out of a "
+                               "full routing table, OSPF LSAs, the ARP or "
+                               "bridge host table. Rows come back one per "
+                               "line as 'print terse' writes them "
+                               "(key=value, flags first: A active, X "
+                               "disabled ...). BGP advertisements are listed "
+                               "only for connections with "
+                               "output.keep-sent-attributes=yes. Only these "
+                               "menus: "
+                               + ", ".join(f"{m} ({d})" for m, d in diag.PRINT_MENUS.items())
+                               + ".",
+                "inputSchema": {"type": "object", "properties": {
+                    "device": device,
+                    "menu": {"type": "string",
+                             "description": "One of the menus above, e.g. "
+                                            "'/routing bgp advertisements'. "
+                                            "A unique ending such as 'bgp "
+                                            "advertisements' will do."},
+                    "where": {"type": "array", "items": {"type": "string"},
+                              "description": "Conditions, all of which must "
+                                             "hold: 'peer=upstream-1', "
+                                             "'dst-address=203.0.113.0/24', "
+                                             "'dst-address in 10.0.0.0/8', "
+                                             "'10.1.2.3 in dst-address' (the "
+                                             "routes covering an address), "
+                                             "'active', '!disabled'."},
+                    "detail": {"type": "boolean",
+                               "description": "'print detail' instead of "
+                                              "terse: every field, wrapped "
+                                              "over several lines."},
+                    "count_only": {"type": "boolean",
+                                   "description": "Only how many rows match."},
+                    "stats": {"type": "boolean",
+                              "description": "'print stats': the counters "
+                                             "(rx/tx errors and drops on "
+                                             "/interface, bytes and packets "
+                                             "on firewall rules), as a table."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 5000,
+                              "description": f"Most lines. Default {DEFAULT_ROW_LIMIT}."},
+                }, "required": ["device", "menu"]},
+                "annotations": ro,
+            }, self.console_print),
+            ({
+                "name": "ethernet_monitor",
+                "description": "The physical link of one ethernet or SFP port "
+                               "(/interface ethernet monitor once): link "
+                               "status, negotiated rate and duplex, and for "
+                               "an SFP module its RX/TX power, temperature "
+                               "and vendor.",
+                "inputSchema": {"type": "object", "properties": {
+                    "device": device,
+                    "interface": {"type": "string", "description": "Ethernet or SFP port name."},
+                }, "required": ["device", "interface"]},
+                "annotations": ro,
+            }, self.ethernet_monitor),
+            ({
+                "name": "torch",
+                "description": "Who is using an interface right now (/tool "
+                               "torch for a few seconds): flows by protocol, "
+                               "source, destination and port, with their "
+                               "rates. Costs the router some CPU while it "
+                               "runs.",
+                "inputSchema": {"type": "object", "properties": {
+                    "device": device,
+                    "interface": {"type": "string", "description": "Interface name."},
+                    "seconds": {"type": "integer", "minimum": 1, "maximum": 10,
+                                "description": "How long to watch. Default 3."},
+                    "src_address": {"type": "string",
+                                    "description": "Only this source address or prefix."},
+                    "dst_address": {"type": "string",
+                                    "description": "Only this destination address or prefix."},
+                    "port": {"type": "integer", "minimum": 1, "maximum": 65535,
+                             "description": "Only flows with this port."},
+                }, "required": ["device", "interface"]},
+                "annotations": ro,
+            }, self.torch),
+            ({
+                "name": "system_health",
+                "description": "Board sensors (/system health print): "
+                               "temperatures, voltages, fans and power "
+                               "supplies, on boards that have them.",
+                "inputSchema": {"type": "object", "properties": {"device": device},
+                                "required": ["device"]},
+                "annotations": ro,
+            }, self.system_health),
         ]
 
     # --- handlers -----------------------------------------------------------
@@ -727,6 +820,63 @@ class ToolBox:
             diag.interface(args.get("interface"), _iface_names(client))
         ))
         return self._console(device, command, timeout=20)
+
+    def console_print(self, args: dict[str, Any]) -> str:
+        device = _device(args)
+        menu = diag.print_menu(args.get("menu"))
+        where = args.get("where") or []
+        if isinstance(where, str):
+            where = [where]
+        command = diag.print_command(
+            menu, [diag.condition(c) for c in where],
+            detail=bool(args.get("detail")), count_only=bool(args.get("count_only")),
+            stats=bool(args.get("stats")),
+        )
+        most = diag.number(args.get("limit"), "limit", 1, 5000, DEFAULT_ROW_LIMIT)
+        # A filtered print over a full table walks every route on the
+        # router, which takes a while on a small CPU.
+        text = self._console(device, command, timeout=90)
+        head, *lines = text.splitlines()
+        lines = [ln for ln in lines if ln.strip()]
+        if not lines:
+            out = [head, "No rows" + (" match." if where else ".")]
+            if where:
+                out.append("# The router says the same for a field name it does not "
+                           "have: check the names with detail=true and no where.")
+            if menu == "/routing bgp advertisements":
+                out.append("# This list is kept only for connections with "
+                           "output.keep-sent-attributes=yes; without it the router "
+                           "records nothing here, whatever it sends.")
+            return "\n".join(out)
+        if len(lines) > most:
+            return "\n".join([head, f"# first {most} of {len(lines)} lines", *lines[:most]])
+        return "\n".join([head, *lines])
+
+    def ethernet_monitor(self, args: dict[str, Any]) -> str:
+        device = _device(args)
+        command = self.source.run(device, lambda client: diag.ethernet_monitor(
+            diag.interface(args.get("interface"), _iface_names(client))
+        ))
+        return self._console(device, command, timeout=20)
+
+    def torch(self, args: dict[str, Any]) -> str:
+        device = _device(args)
+        seconds = diag.number(args.get("seconds"), "seconds", 1, 10, 3)
+        port = diag.number(args.get("port"), "port", 1, 65535, 0) or None
+        src, dst = args.get("src_address"), args.get("dst_address")
+        command = self.source.run(device, lambda client: diag.torch(
+            diag.interface(args.get("interface"), _iface_names(client)),
+            seconds=seconds, src=str(src) if src else None,
+            dst=str(dst) if dst else None, port=port,
+        ))
+        head, *lines = self._console(device, command, timeout=seconds + 20).splitlines()
+        rows = [ln for ln in diag.last_screen(lines) if ln.strip()]
+        if not rows:
+            return f"{head}\nNo traffic seen in {seconds}s."
+        return "\n".join([head, *rows])
+
+    def system_health(self, args: dict[str, Any]) -> str:
+        return self._console(_device(args), diag.HEALTH_COMMAND, timeout=20)
 
 
 #: Log lines read_log returns unless asked for more.

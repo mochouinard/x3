@@ -111,3 +111,179 @@ def monitor_traffic(quoted_iface: str) -> str:
 #: an expression, and an expression is exactly what must not be built from a
 #: model's text.
 LOG_COMMAND = "/log print without-paging"
+
+
+# --- console_print ----------------------------------------------------------
+
+#: Menus console_print may print, keyed by their console path. ``print`` is
+#: only harmless on a menu: on a command it becomes an argument
+#: (``/file remove print`` removes a file called "print"), so the path is
+#: never free text. Menus whose rows hold keys (IPsec installed SAs, PPP
+#: secrets, users) are left out, whatever the redaction would catch.
+PRINT_MENUS: dict[str, str] = {
+    "/routing bgp advertisements": "prefixes sent to each BGP peer",
+    "/routing bgp session": "BGP sessions, state and counters",
+    "/routing bgp connection": "BGP connection settings",
+    "/routing bgp template": "BGP templates",
+    "/routing route": "every route of every protocol, active or not",
+    "/routing table": "routing tables and VRFs",
+    "/routing filter rule": "routing filter rules",
+    "/routing ospf neighbor": "OSPF neighbours",
+    "/routing ospf lsa": "OSPF link-state database",
+    "/routing ospf interface": "OSPF interfaces",
+    "/routing rule": "policy routing rules",
+    "/ip route": "IPv4 routes",
+    "/ipv6 route": "IPv6 routes",
+    "/ip address": "IPv4 addresses",
+    "/ipv6 address": "IPv6 addresses",
+    "/ip arp": "ARP table",
+    "/ipv6 neighbor": "IPv6 neighbour table",
+    "/ip neighbor": "discovered neighbours (MNDP/CDP/LLDP)",
+    "/ip pool used": "addresses handed out from pools",
+    "/ip dhcp-server lease": "DHCP leases",
+    "/ip dhcp-client": "DHCP clients",
+    "/ip firewall connection": "connection tracking table",
+    "/ip firewall address-list": "firewall address lists",
+    "/ip firewall filter": "firewall filter rules with counters",
+    "/ip firewall nat": "NAT rules with counters",
+    "/ip firewall mangle": "mangle rules with counters",
+    "/ip firewall raw": "raw rules with counters",
+    "/ipv6 firewall filter": "IPv6 firewall filter rules",
+    "/ip ipsec active-peers": "IPsec peers that are up",
+    "/interface": "all interfaces",
+    "/interface bridge host": "bridge MAC table",
+    "/interface bridge vlan": "bridge VLAN table",
+    "/interface vrrp": "VRRP instances",
+    "/ppp active": "PPP sessions that are up",
+    "/mpls ldp neighbor": "LDP neighbours",
+    "/mpls forwarding-table": "MPLS forwarding table",
+}
+
+_FIELD = r"[a-z][a-z0-9.-]{0,63}"
+#: A value typed bare: an address, a number, a name. Nothing the console
+#: reads as an operator, a variable or a command.
+_BARE_VALUE = re.compile(r"[A-Za-z0-9._:/@+-]{1,128}")
+#: A value typed in double quotes. Inside quotes the router still evaluates
+#: ``$``, ``[...]`` and ``\\``, and ``?`` opens help at the terminal, so none
+#: of those (nor a quote) may appear.
+_QUOTED_VALUE = re.compile(r"[A-Za-z0-9 ._:/@+,()-]{1,128}")
+_COND_EQ = re.compile(rf"({_FIELD})\s*(!=|=)\s*(.+)")
+_COND_IN = re.compile(rf"(\S+)\s+in\s+(\S+)")
+_COND_FLAG = re.compile(rf"(!?)\s*({_FIELD})")
+
+
+def print_menu(value: object) -> str:
+    """``value`` as a key of :data:`PRINT_MENUS`: by full path in any
+    spelling (``routing/bgp/advertisements``), else by a unique ending."""
+    words = re.split(r"[\s/]+", str(value or "").strip().lower())
+    words = [w for w in words if w]
+    if not words:
+        raise ToolError("menu is required. One of: " + ", ".join(PRINT_MENUS))
+    want = "/" + " ".join(words)
+    if want in PRINT_MENUS:
+        return want
+    hits = [m for m in PRINT_MENUS if m.endswith(" " + " ".join(words))]
+    if len(hits) == 1:
+        return hits[0]
+    raise ToolError(
+        f"console_print cannot print {want!r}"
+        + (f" (it matches {', '.join(hits)})" if hits else "")
+        + ". It prints only: " + ", ".join(PRINT_MENUS)
+        + ". For anything Winbox shows, use read_menu."
+    )
+
+
+def _network(text: str) -> str:
+    try:
+        return str(ipaddress.ip_network(text, strict=False))
+    except ValueError:
+        raise ToolError(f"{text!r} is not an address or prefix.") from None
+
+
+def _value(text: str) -> str:
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    if _BARE_VALUE.fullmatch(text):
+        return text
+    if _QUOTED_VALUE.fullmatch(text):
+        return f'"{text}"'
+    raise ToolError(
+        f"The value {text!r} has characters this tool will not type at a "
+        "console ($ [ ] \\ \" ? and control characters are refused)."
+    )
+
+
+def condition(text: object) -> str:
+    """One where-condition, rebuilt from its checked parts:
+
+    ``field=value`` / ``field!=value``, ``field in 10.0.0.0/8`` (field's
+    address inside the prefix), ``10.1.2.3 in field`` (field's prefix
+    covers the address), ``flag`` or ``!flag`` (``active``, ``!disabled``).
+    """
+    raw = str(text or "").strip()
+    m = _COND_IN.fullmatch(raw)
+    if m:
+        left, right = m.groups()
+        if re.fullmatch(_FIELD, left) and not re.fullmatch(_FIELD, right):
+            return f"{left} in {_network(right)}"
+        if re.fullmatch(_FIELD, right) and not re.fullmatch(_FIELD, left):
+            return f"{_network(left)} in {right}"
+    m = _COND_EQ.fullmatch(raw)
+    if m:
+        field, op, value = m.groups()
+        return f"{field}{op}{_value(value)}"
+    m = _COND_FLAG.fullmatch(raw)
+    if m:
+        bang, field = m.groups()
+        return f"{bang}{field}"
+    raise ToolError(
+        f"Cannot read the condition {raw!r}. Use field=value, field!=value, "
+        "'field in 10.0.0.0/8', '10.1.2.3 in field', 'flag' or '!flag'."
+    )
+
+
+def print_command(menu: str, conditions: list[str], *, detail: bool = False,
+                  count_only: bool = False, stats: bool = False) -> str:
+    parts = [menu, "print"]
+    if count_only:
+        parts.append("count-only")
+    elif stats:
+        # The counters view. The router prints it as a table whatever else
+        # is asked, so terse would only be ignored.
+        parts.append("stats")
+    else:
+        parts.append("detail" if detail else "terse")
+    parts.append("without-paging")
+    if conditions:
+        parts += ["where", " and ".join(conditions)]
+    return " ".join(parts)
+
+
+# --- link and health ----------------------------------------------------------
+
+def ethernet_monitor(quoted_iface: str) -> str:
+    return f"/interface ethernet monitor {quoted_iface} once"
+
+
+HEALTH_COMMAND = "/system health print without-paging"
+
+
+def torch(quoted_iface: str, *, seconds: int, src: str | None = None,
+          dst: str | None = None, port: int | None = None) -> str:
+    parts = ["/tool torch", f"interface={quoted_iface}", f"duration={seconds}s"]
+    if src:
+        parts.append(f"src-address={_network(src)}")
+    if dst:
+        parts.append(f"dst-address={_network(dst)}")
+    if port is not None:
+        parts.append(f"port={port}")
+    return " ".join(parts)
+
+
+def last_screen(lines: list[str], marker: str = "Columns:") -> list[str]:
+    """What a redrawing tool showed last: torch prints a fresh table every
+    second, and only the final one is the answer."""
+    starts = [i for i, ln in enumerate(lines) if ln.lstrip().startswith(marker)]
+    kept = lines[starts[-1]:] if starts else lines
+    return [ln for ln in kept if not ln.lstrip().startswith("-- [")]
