@@ -323,12 +323,13 @@ An approved change runs like this:
 1. the checklist once, to see what already fails before anything is touched;
 2. an export, saved with x3's other config snapshots;
 3. Safe Mode, then a timer on the router itself: a scheduler entry that runs
-   `/safe-mode unroll` at a deadline;
+   `/safe-mode unroll` at a deadline, followed by x3's own ways back (below);
 4. the commands, one at a time;
 5. the checklist, each check retried for as long as it was given;
 6. every check passed: the timer is removed and Safe Mode released, so the
-   change is kept. Anything else: it is discarded, and the export compared
-   with the saved one before the window says **Reverted**.
+   change is kept. Anything else: it is discarded, x3 undoes by hand what the
+   discard left, and the export is compared with the saved one before the
+   window says **Reverted**.
 
 "Anything else" includes a command the console answers at all (a write that
 worked prints nothing), a failed check, **Revert now**, closing the window, and
@@ -338,9 +339,24 @@ router leaves the session looking alive from the router's side, and the change
 stays held; the timer undoes it at the deadline whoever is still connected. It
 needs version 7.18 or newer, and without it no change is made.
 
-A checklist entry is a ping from the router (`max_loss_pct`) or a count of rows
-in a `console_print` menu (`min`/`max`, with the same conditions), each with an
-optional `within_s`. A command is one `add`, `set`, `remove`, `enable`,
+Safe Mode's undo does not take back everything it holds. Measured on 7.19.4
+and 7.23.3, with the router's own rollback as much as with x3's: a firewall
+rule disabled under Safe Mode stays disabled, and on 7.19.4 a route added
+under it stays. So x3 keeps exact ways back of its own, none of them written
+by the assistant: the id of every object an `add` made, read back from the
+router, and the enabled or disabled state of every object an `enable`,
+`disable` or `disabled=` is about to touch. They are in the timer's script
+before the command they belong to is run (an `add` and its own removal go in
+as one console line, so a route that cuts the path is already covered), and
+after a discard they are applied to whatever the undo left. If the export
+still differs after that, the window says **Not confirmed** and lists the
+lines; `change_status` gives the assistant the same list, with each command's
+own result.
+
+A checklist entry is a ping from the router (`max_loss_pct`), a count of rows
+in a `console_print` menu (`min`/`max`, with the same conditions), or a count
+of export lines matching a regular expression, each with an optional
+`within_s`. A command is one `add`, `set`, `remove`, `enable`,
 `disable`, `move`, `unset` or `comment` on a menu, written out in full: no
 scripting, no computed values, one change per line. Users, files, packages,
 certificates, scripts and the scheduler are not changed this way.
@@ -352,7 +368,9 @@ answered, every step and the result.
 
 This is a guard against a change that breaks something the checklist can see.
 It does not make a change safe that you would not have made yourself: read the
-commands.
+commands. And it has been wrong once already about what a router undoes; the
+export comparison is what it trusts, and a result of **Not confirmed** means
+look at the router.
 
 ## Development
 

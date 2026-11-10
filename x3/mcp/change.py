@@ -24,6 +24,19 @@ Safe Mode is a timer on the router itself, a scheduler entry that runs
 holds, itself included, whoever is or is not still connected. A change that
 passes removes the timer just before Safe Mode is released.
 
+Nor does Safe Mode's undo take back everything it holds. Measured on 7.19.4
+and 7.23.3, with the router's own rollback as much as with ours: a firewall
+rule disabled under Safe Mode stays disabled (both versions), and a route
+added under it stays (7.19.4). So the run keeps exact ways back of its own,
+none of them written by the assistant: the id of every object an ``add``
+made, read back from the router, and the enabled/disabled state of every
+object an enable or disable is about to touch, read before it does. They are
+used twice. They ride in the timer's script after the unroll, put there
+before the command they belong to can cut the path (an ``add`` and its
+removal go in as one console line), and after a discard they are applied to
+whatever the undo left. What still differs after that is reported line by
+line, and the run does not say "reverted".
+
 This module is the half without Qt: the job file, what a command and a check
 may be, the per-device policy, and the run itself.
 """
@@ -66,6 +79,10 @@ RECONNECT_AFTER_DEADLINE_S = 60.0
 #: the router's own revert timer; and the least a deadline may be.
 DEADLINE_MARGIN_S = 90
 DEADLINE_MIN_S = 180
+#: The timer's script is typed at a console, on one line. Past this many
+#: characters of it, a command is refused before it is typed rather than
+#: risk a line the console cuts.
+MAX_TIMER_SCRIPT = 3000
 #: ``/safe-mode unroll`` exists from this version on. Without it there is no
 #: router-side timer, and without the timer no change is made.
 TIMER_NEEDS = (7, 18)
@@ -168,17 +185,85 @@ def check_command(line: object) -> str:
     return text
 
 
-def _menu_and_verb(text: str) -> tuple[str, str | None]:
-    """``/ip/address add ...`` -> ("/ip address", "add"); verb None if the
-    words run out, or stop being words, before one is found."""
+def _parts(text: str) -> tuple[str, str | None, str]:
+    """``/ip/address add address=...`` -> ("/ip address", "add", "address=...").
+    The verb is None if the words run out, or stop being words, before one
+    is found."""
     words: list[str] = []
-    for word in re.split(r"[\s/]+", text.lstrip("/")):
+    for m in re.finditer(r"[^\s/]+", text):
+        word = m.group(0)
         if not _WORD.fullmatch(word):
-            return "/" + " ".join(words), None
+            break
         if word in WRITE_VERBS and words:
-            return "/" + " ".join(words), word
+            return "/" + " ".join(words), word, text[m.end():].strip()
         words.append(word)
-    return "/" + " ".join(words), None
+    return "/" + " ".join(words), None, ""
+
+
+def _menu_and_verb(text: str) -> tuple[str, str | None]:
+    menu, verb, _rest = _parts(text)
+    return menu, verb
+
+
+_ID = re.compile(r"\*[0-9A-Fa-f]+")
+
+
+def _outside(rest: str) -> str:
+    """``rest`` with what is inside quotes and brackets blanked out, so a
+    word is only found where the console would read it as an argument."""
+    out, quoted, depth, i = [], False, 0, 0
+    while i < len(rest):
+        c = rest[i]
+        if quoted:
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                quoted = False
+            out.append(" ")
+        elif c == '"':
+            quoted = True
+            out.append(" ")
+        elif c == "[":
+            depth += 1
+            out.append(" ")
+        elif c == "]":
+            depth -= 1
+            out.append(" ")
+        else:
+            out.append(" " if depth else c)
+        i += 1
+    return "".join(out)
+
+
+def _touches_disabled(verb: str | None, rest: str) -> bool:
+    return verb in ("enable", "disable") or (
+        verb == "set" and re.search(r"(?<![\w-])disabled=", _outside(rest)) is not None)
+
+
+def _target(rest: str) -> tuple[str, str] | None:
+    """What a set-type command acts on: ("find", "find comment=x") for a
+    leading ``[find ...]``, ("id", "*1F") for a leading id, else None (a
+    name or a number: not something this can turn into ids)."""
+    if rest.startswith("["):
+        quoted, i = False, 1
+        while i < len(rest):
+            c = rest[i]
+            if quoted:
+                if c == "\\":
+                    i += 1
+                elif c == '"':
+                    quoted = False
+            elif c == '"':
+                quoted = True
+            elif c == "]":
+                inner = rest[1:i].strip()
+                return ("find", inner) if _FIND.fullmatch(inner) else None
+            i += 1
+        return None
+    m = _ID.match(rest)
+    if m and (m.end() == len(rest) or rest[m.end()].isspace()):
+        return ("id", m.group(0))
+    return None
 
 
 # --- what a check may be --------------------------------------------------------
@@ -191,7 +276,11 @@ def check_check(raw: object) -> dict[str, Any]:
     ``{"type": "rows", "menu": "/routing bgp session", "where": [...], "min": 1}``
         how many rows a console_print would return; optional max.
 
-    Either takes ``within_s``: keep trying this long before calling it
+    ``{"type": "export", "match": "regex", "section": "/ip firewall nat", "min": 1}``
+        how many lines of the export match; matched here, on the text, so no
+        field name or value form can make it miss what is there.
+
+    Each takes ``within_s``: keep trying this long before calling it
     failed (a BGP session takes a while to come back), and ``name``.
     """
     if not isinstance(raw, dict):
@@ -221,8 +310,24 @@ def check_check(raw: object) -> dict[str, Any]:
             lo = 1
         out["min"] = None if lo is None else diag.number(lo, "min", 0, 10_000_000, 0)
         out["max"] = None if hi is None else diag.number(hi, "max", 0, 10_000_000, 0)
+    elif kind == "export":
+        pattern = str(raw.get("match") or "")
+        if not pattern:
+            raise ToolError("An export check needs 'match': a regular expression.")
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            raise ToolError(f"match is not a regular expression: {e}") from None
+        out["match"] = pattern[:300]
+        words = str(raw.get("section") or "").replace("/", " ").split()
+        out["section"] = "/" + " ".join(words).lower() if words else ""
+        lo, hi = raw.get("min"), raw.get("max")
+        if lo is None and hi is None:
+            lo = 1
+        out["min"] = None if lo is None else diag.number(lo, "min", 0, 10_000_000, 0)
+        out["max"] = None if hi is None else diag.number(hi, "max", 0, 10_000_000, 0)
     else:
-        raise ToolError("A check's type is 'ping' or 'rows'.")
+        raise ToolError("A check's type is 'ping', 'rows' or 'export'.")
     name = str(raw.get("name") or "").strip()
     out["name"] = name[:80] if name else describe_check(out)
     return out
@@ -241,9 +346,13 @@ def describe_check(c: dict[str, Any]) -> str:
             want.append(f"at least {c['min']}")
         if c.get("max") is not None:
             want.append(f"at most {c['max']}")
-        text = f"{c['menu']}: {' and '.join(want)} row(s)"
-        if c.get("where"):
-            text += " where " + " and ".join(c["where"])
+        if c["type"] == "export":
+            text = (f"export{' ' + c['section'] if c.get('section') else ''}: "
+                    f"{' and '.join(want)} line(s) matching {c['match']}")
+        else:
+            text = f"{c['menu']}: {' and '.join(want)} row(s)"
+            if c.get("where"):
+                text += " where " + " and ".join(c["where"])
     if c.get("within_s"):
         text += f", within {c['within_s']}s"
     return text
@@ -410,6 +519,17 @@ def run_check(client: DeviceClient, c: dict[str, Any]) -> tuple[bool, str]:
                 loss = 100.0 * (sent - received) / sent if sent else 100.0
                 return loss <= c["max_loss_pct"], f"{received}/{sent} replies ({loss:.0f}% lost)"
         return False, "no ping summary: " + (lines[-1] if lines else "no output")
+    if c["type"] == "export":
+        got = client.export_config(show_sensitive=False)
+        lines = [ln for ln in cexp.redact(got.text).splitlines()
+                 if ln.strip() and not ln.startswith("#")]
+        if c.get("section"):
+            lines = [ln for ln in lines
+                     if ln == c["section"] or ln.startswith(c["section"] + " ")]
+        pattern = re.compile(c["match"], re.I)
+        n = sum(1 for ln in lines if pattern.search(ln))
+        ok = (c.get("min") is None or n >= c["min"]) and (c.get("max") is None or n <= c["max"])
+        return ok, f"{n} line(s)"
     command = diag.print_command(c["menu"], c["where"], count_only=True)
     got = client.run_console(command, timeout=60)
     lines = _output_lines(got)
@@ -462,6 +582,12 @@ class ChangeRun:
         self._held = False
         #: When the router's own timer fires (monotonic), once it is set.
         self._timer_at: float | None = None
+        #: Ways back that do not depend on Safe Mode's undo, newest first:
+        #: ("remove", menu, id) for an object this run added, and
+        #: ("disabled", menu, id, "yes"|"no") for a state it was about to change.
+        self._repairs: list[tuple[str, ...]] = []
+        #: The export last compared with the snapshot, for saying what differs.
+        self._seen: Any = None
 
     # -- reporting
 
@@ -485,9 +611,125 @@ class ChangeRun:
 
     # -- the run
 
+    # -- ways back of our own
+
+    @staticmethod
+    def _statement(repair: tuple[str, ...]) -> str:
+        if repair[0] == "remove":
+            return f"{repair[1]} remove {repair[2]}"
+        return f"{repair[1]} set {repair[2]} disabled={repair[3]}"
+
+    def _timer_script(self, repairs: list[tuple[str, ...]] | None = None) -> str:
+        """What the router runs at the deadline: Safe Mode's own rollback,
+        then each way back of ours, each allowed to fail (the undo usually
+        got there first)."""
+        steps = ["/safe-mode unroll"]
+        steps += [f":do {{{self._statement(r)}}} on-error={{}}"
+                  for r in (self._repairs if repairs is None else repairs)]
+        # Last, itself: the unroll normally removes the entry (it was added
+        # under Safe Mode), and an entry left behind would fire again and
+        # again, on whatever Safe Mode someone holds by then.
+        steps.append(f":do {{{self._drop_timer()}}} on-error={{}}")
+        return "; ".join(steps)
+
+    def _drop_timer(self) -> str:
+        return f"/system scheduler remove [find name={timer_name(self.job)}]"
+
+    def _set_timer_script(self, client: DeviceClient, repairs: list[tuple[str, ...]]) -> None:
+        script = self._timer_script(repairs)
+        if len(script) > MAX_TIMER_SCRIPT:
+            raise _Revert("this change touches more objects than the revert timer can "
+                          "carry ways back for; split it into smaller changes")
+        got = client.run_console(
+            f'/system scheduler set [find name={timer_name(self.job)}] on-event="{script}"',
+            timeout=30)
+        said = _output_lines(got)
+        if said or got.console_error or not got.complete:
+            raise _Revert("the revert timer could not be updated: "
+                          + ("; ".join(said) or got.console_error or "no answer"))
+
+    def _disabled_now(self, client: DeviceClient, menu: str,
+                      target: tuple[str, str]) -> dict[str, str]:
+        """id -> "yes"/"no" for every object a command is about to act on."""
+        kind, what = target
+        if kind == "id":
+            command = f':put ("{what} " . [{menu} get {what} disabled])'
+        else:
+            command = (f':foreach i in=[{menu} {what}] do='
+                       f'{{:put ("$i " . [{menu} get $i disabled])}}')
+        out: dict[str, str] = {}
+        for ln in _output_lines(client.run_console(command, timeout=30)):
+            m = re.fullmatch(r"(\*[0-9A-Fa-f]+) (true|false)", ln)
+            if m:
+                out[m.group(1)] = "yes" if m.group(2) == "true" else "no"
+        return out
+
+    def _type(self, client: DeviceClient, command: str) -> tuple[Any, list[str], str | None]:
+        """Type one of the change's commands: (result, what it printed, the
+        id of what it added).
+
+        A set-type command that turns something on or off first has the
+        state it is about to change put in the timer. An ``add`` is typed
+        as one line that adds, puts its own removal in the timer and prints
+        the new id: if the add itself cuts the path, the removal is already
+        on the router.
+        """
+        menu, verb, rest = _parts(command)
+        if _touches_disabled(verb, rest):
+            target = _target(rest)
+            if target is not None:
+                known = {r[2] for r in self._repairs if r[0] == "disabled" and r[1] == menu}
+                fresh = [("disabled", menu, oid, old)
+                         for oid, old in self._disabled_now(client, menu, target).items()
+                         if oid not in known]
+                if fresh:
+                    self._set_timer_script(client, fresh + self._repairs)
+                    self._repairs = fresh + self._repairs
+        if verb != "add":
+            got = client.run_console(command, timeout=45)
+            return got, _output_lines(got), None
+        rest_of_script = self._timer_script()[len("/safe-mode unroll"):]
+        if len(rest_of_script) + 120 > MAX_TIMER_SCRIPT:
+            raise _Revert("this change touches more objects than the revert timer can "
+                          "carry ways back for; split it into smaller changes")
+        line = (f':local i [{command}]; /system scheduler set [find name={timer_name(self.job)}] '
+                f'on-event=("/safe-mode unroll; :do {{{menu} remove " . $i . "}} on-error={{}}'
+                f'{rest_of_script}"); :put $i')
+        got = client.run_console(line, timeout=45)
+        said = _output_lines(got)
+        if len(said) == 1 and _ID.fullmatch(said[0]):
+            self._repairs.insert(0, ("remove", menu, said[0]))
+            return got, [], said[0]
+        return got, said, None
+
+    def _repair(self, client: DeviceClient) -> list[str]:
+        """After a discard: apply each way back to whatever the undo left.
+        Returns what it had to do, in words; empty when the undo did it all."""
+        done: list[str] = []
+        # The timer first: it must not outlive the change it was set for.
+        client.run_console(self._drop_timer(), timeout=30)
+        for r in list(self._repairs):
+            if r[0] == "remove":
+                got = client.run_console(self._statement(r), timeout=30)
+                if got.complete and not got.console_error and not _output_lines(got):
+                    done.append(f"removed {r[1]} {r[2]}: Safe Mode's undo had left it in place")
+                continue
+            now = _output_lines(client.run_console(f":put [{r[1]} get {r[2]} disabled]", timeout=30))
+            state = {"true": "yes", "false": "no"}.get(now[-1] if now else "")
+            if state is not None and state != r[3]:
+                got = client.run_console(self._statement(r), timeout=30)
+                if got.complete and not got.console_error and not _output_lines(got):
+                    done.append(f"set {r[1]} {r[2]} back to disabled={r[3]}: Safe Mode's "
+                                "undo had not restored it")
+        return done
+
     def run(self) -> dict[str, Any]:
         """Do it. Returns the result: ``status`` plus what was seen."""
-        result: dict[str, Any] = {"baseline": [], "checks": [], "applied": 0}
+        result: dict[str, Any] = {
+            "baseline": [], "checks": [], "applied": 0,
+            "commands": [{"n": i, "command": c, "ok": None, "said": ""}
+                         for i, c in enumerate(self.job["commands"], 1)],
+        }
         try:
             status, why = self._run(result)
         finally:
@@ -540,7 +782,7 @@ class ChangeRun:
             # this session never returns, the timer undoes all of it.
             limit = deadline_s(job)
             timer = (f'/system scheduler add name={timer_name(job)} interval={limit}s '
-                     f'on-event="/safe-mode unroll" comment="x3 change {job["id"]}: '
+                     f'on-event="{self._timer_script([])}" comment="x3 change {job["id"]}: '
                      'reverts it unless the checks pass"')
             self._say("timer", f"Setting the router's own revert timer: {limit}s from now",
                       deadline_s=limit)
@@ -562,27 +804,34 @@ class ChangeRun:
             for i, command in enumerate(job["commands"], 1):
                 self._still_time()
                 self._say("apply", f"{i}/{len(job['commands'])}: {command}")
-                got = client.run_console(command, timeout=45)
-                said = _output_lines(got)
+                entry = result["commands"][i - 1]
+                held = client.safe_mode_pending()
+                got, said, new_id = self._type(client, command)
                 if said or got.console_error:
                     answer = "; ".join(said) or got.console_error
+                    entry.update(ok=False, said=answer)
                     result["failed_command"] = {"n": i, "command": command, "said": answer}
                     raise _Revert(f"command {i} was refused: {answer}")
                 if not got.complete:
+                    entry.update(ok=False, said="no answer in 45s")
                     result["failed_command"] = {"n": i, "command": command,
                                                 "said": "no answer in 45s"}
                     raise _Revert(f"command {i} got no answer in 45s; it may have cut "
                                   "the connection to the router")
                 result["applied"] = i
                 now = client.safe_mode_pending()
-                if now is None or now <= pending:
+                # An add is typed with its timer update, which is a History
+                # row of its own: the add's row is the second.
+                need = 2 if _parts(command)[1] == "add" else 1
+                if now is None or held is None or now < held + need:
+                    entry.update(ok=False, said="no undoable change recorded")
                     result["failed_command"] = {"n": i, "command": command,
                                                 "said": "no undoable change recorded"}
                     raise _Revert(
                         f"the router recorded no undoable change for command {i}; "
                         "Safe Mode may not be able to take it back"
                     )
-                pending = now
+                entry.update(ok=True, said=f"added {new_id}" if new_id else "")
             if job.get("settle_s"):
                 self._say("settle", f"Waiting {job['settle_s']}s for the network to settle")
                 self._wait(job["settle_s"])
@@ -597,17 +846,18 @@ class ChangeRun:
             # 3. Everything passed. The timer goes first: released with it
             #    still there, it would fire later on a Safe Mode that is no
             #    longer this change's.
-            got = client.run_console(f"/system scheduler remove [find name={timer_name(job)}]", timeout=30)
+            held = client.safe_mode_pending()
+            got = client.run_console(self._drop_timer(), timeout=30)
             said = _output_lines(got)
             now = client.safe_mode_pending()
             if said or got.console_error or not got.complete:
                 raise _Revert("the revert timer could not be removed: "
                               + ("; ".join(said) or got.console_error or "no answer"))
-            if now is None or now != pending + 1:
+            if now is None or held is None or held <= pending or now != held + 1:
                 # Fewer held than were made: the timer fired, or someone else
                 # undid part of it. Not a state to keep.
                 raise _Revert("what Safe Mode holds is not what this change made "
-                              f"({now} held, {pending + 1} expected)")
+                              f"({now} held after {held})")
         except _Revert as e:
             return self._undo(result, str(e))
         except (DeviceError, OSError, ToolError) as e:
@@ -659,15 +909,41 @@ class ChangeRun:
                     client.drop_session()
                 finally:
                     self._held = False
+        repaired: list[str] = []
+        if orderly and self._timer_at is not None:
+            try:
+                repaired = self._repair(client)
+            except Exception as e:  # noqa: BLE001 -- the export below is the judge
+                self._say("revert", f"Could not finish undoing by hand: {e}")
         verdict = self._verify(orderly)
-        result["revert"] = {"orderly": orderly, "verified": verdict}
+        if verdict == "differs" and not orderly and self._timer_at is not None:
+            # The router rolled back by itself, and left what its undo does
+            # not take back. Our own ways back, through a session of its own.
+            try:
+                again = self._connect(True)
+                try:
+                    repaired = self._repair(again)
+                    self._seen = again.export_config(show_sensitive=False)
+                    verdict = "same" if self._seen.digest == self._before.digest else "differs"
+                finally:
+                    again.close()
+            except Exception as e:  # noqa: BLE001
+                self._say("revert", f"Could not finish undoing by hand: {e}")
+        for line in repaired:
+            self._say("revert", line[0].upper() + line[1:])
+        result["revert"] = {"orderly": orderly, "verified": verdict, "repaired": repaired}
         if verdict == "same":
             self._say("revert", "Reverted: the configuration is identical to the snapshot")
             return REVERTED, why
         if verdict == "differs":
-            self._say("revert", "The configuration still differs from the snapshot")
-            return UNCERTAIN, (f"{why}. The revert was asked for, but the export still "
-                               "differs from the snapshot taken before. Look at the router.")
+            left = _diff(self._before.text, self._seen.text) if self._seen is not None else []
+            result["leftover"] = left
+            self._say("revert", "The configuration still differs from the snapshot:")
+            for line in left[:40]:
+                self._say("revert", f"  {line}")
+            return UNCERTAIN, (f"{why}. The revert was done, but the export still differs "
+                               "from the snapshot taken before (see what is left). Safe "
+                               "Mode's undo does not take back every kind of change.")
         self._say("revert", "Could not get back in to confirm the revert")
         return UNCERTAIN, (f"{why}. The router's own timer reverts the change at its "
                            "deadline, but the router could not be reached again to confirm.")
@@ -706,6 +982,7 @@ class ChangeRun:
                             fresh.close()
                         except Exception:  # noqa: BLE001
                             pass
+                self._seen = now
                 last = "same" if now.digest == self._before.digest else "differs"
             except Exception:  # noqa: BLE001 -- not reachable yet is an answer too
                 own = False
@@ -746,9 +1023,19 @@ def report(job: dict[str, Any]) -> str:
         out.append(f"why: {res['why']}")
     if job.get("note"):
         out.append(f"note from the user: {job['note']}")
-    if res.get("failed_command"):
-        f = res["failed_command"]
-        out.append(f"command {f['n']} ({f['command']}) -> {f['said']}")
+    commands = res.get("commands") or []
+    if any(c.get("ok") is not None for c in commands):
+        out.append("commands:")
+        for c in commands:
+            mark = {True: "ok  ", False: "FAIL", None: "-   "}[c.get("ok")]
+            tail = "" if c.get("ok") else f" -> {c.get('said') or 'not run'}"
+            out.append(f"  {mark}  {c['n']}. {c['command']}{tail}")
+    revert = res.get("revert") or {}
+    for line in revert.get("repaired") or []:
+        out.append(f"undone by x3 itself: {line}")
+    if res.get("leftover"):
+        out.append("still different from before the change (- was, + is now):")
+        out += [f"  {ln}" for ln in res["leftover"]]
     for title, key in (("before the change", "baseline"), ("after the change", "checks")):
         rows = res.get(key) or []
         if rows:

@@ -546,15 +546,30 @@ out = on(cc).console_print({"device": "x", "menu": "BGP/Advertisements",
                             "where": ["peer = upstream-1", "prefix=203.0.113.0/24"]})
 check("console_print types one print, terse, with the where rebuilt",
       cc.typed, ["/routing bgp advertisements print terse without-paging "
-                 "where peer=upstream-1 and prefix=203.0.113.0/24"])
+                 'where peer="upstream-1" and prefix="203.0.113.0/24"'])
 check("and returns the rows under it", out.splitlines()[1:],
       ["0 peer=upstream-1 prefix=203.0.113.0/24 nexthop=1.2.3.4"])
 check("every condition shape",
       [diag.condition(c) for c in ["dst-address in 203.0.113.7/24", "8.8.8.8 in dst-address",
                                    "active", "! disabled", "comment='site a'",
-                                   "routing-table!=main"]],
+                                   "routing-table!=main", "interface~^vrrp"]],
       ["dst-address in 203.0.113.0/24", "8.8.8.8/32 in dst-address", "active",
-       "!disabled", 'comment="site a"', "routing-table!=main"])
+       "!disabled", 'comment="site a"', 'routing-table!="main"', 'interface~"^vrrp"'])
+# Bare, an address value matches nothing on a firewall menu or on /ip address,
+# and the router does not say so; quoted, it matches everywhere (7.19.4, 7.23.3).
+check("a value is always typed quoted",
+      [diag.condition(c) for c in ["dst-address=203.0.113.0/24", "distance=7", "chain=srcnat"]],
+      ['dst-address="203.0.113.0/24"', 'distance="7"', 'chain="srcnat"'])
+check("yes/no matches neither way with '=': it is typed as the flag",
+      [diag.condition(c) for c in ["disabled=no", "disabled=yes", "dynamic!=yes", "active=true"]],
+      ["!disabled", "disabled", "!dynamic", "active"])
+check("what the console would evaluate inside quotes is escaped, so it is only text",
+      [diag.condition(c) for c in ["comment=$x", "comment=[/system reboot]", "comment~a\\.b$",
+                                   'comment=say "hi"', "comment=why?",
+                                   "a=b; /system reboot", "peer=x and disabled=yes"]],
+      ['comment="\\$x"', 'comment="[/system reboot]"', 'comment~"a\\\\.b\\$"',
+       'comment="say \\"hi\\""', 'comment="why\\3F"',
+       'a="b; /system reboot"', 'peer="x and disabled=yes"'])
 check("count_only and detail",
       [diag.print_command("/ip route", [], count_only=True),
        diag.print_command("/ip route", ["active"], detail=True)],
@@ -568,15 +583,14 @@ for bad_menu in ["/file remove", "/system script run", "/user", "/ppp secret",
         ok(f"console_print refuses menu {bad_menu!r}", False)
     except ToolError:
         ok(f"console_print refuses menu {bad_menu!r}", cc.typed == [])
-for bad in ['comment=$x', 'comment=[/system reboot]', 'name="a" or 1', 'name=a\\b',
-            'x=a"b', 'name=?', 'dst-address in [:put 1]', 'a=b; /system reboot',
-            '1.2.3.4 in 5.6.7.8', 'peer=x\r/system reboot', 'peer=x and disabled=yes']:
+for bad in ['comment=caf\u00e9', 'peer=x\r/system reboot', '1.2.3.4 in 5.6.7.8',
+            'dst-address in [:put 1]', 'a b c', 'comment=', 'x=' + 'y' * 300]:
     cc = ConsoleClient("")
     try:
         on(cc).console_print({"device": "x", "menu": "ip route", "where": [bad]})
-        ok(f"console_print refuses where {bad!r}", False, cc.typed)
+        ok(f"console_print refuses where {bad[:30]!r}", False, cc.typed)
     except ToolError:
-        ok(f"console_print refuses where {bad!r}", cc.typed == [])
+        ok(f"console_print refuses where {bad[:30]!r}", cc.typed == [])
 cc = ConsoleClient("")
 out = on(cc).console_print({"device": "x", "menu": "bgp advertisements", "where": ["peer=a"]})
 ok("an empty advertisements list says why it may be empty",
@@ -624,7 +638,16 @@ check("system_health types its fixed command", cc.typed, ["/system health print 
 cc = ConsoleClient("0 R ether1 1 2")
 on(cc).console_print({"device": "x", "menu": "interface", "stats": True, "where": ["name=ether1"]})
 check("console_print stats prints the counters view",
-      cc.typed, ["/interface print stats without-paging where name=ether1"])
+      cc.typed, ['/interface print stats without-paging where name="ether1"'])
+cc = ConsoleClient("0")
+out = on(cc).console_print({"device": "x", "menu": "ip firewall nat", "count_only": True,
+                            "where": ["dst-address=203.0.113.0/24"]})
+ok("a count of 0 under a where says what else 0 can mean",
+   out.splitlines()[1] == "0" and "field name" in out, out)
+cc = ConsoleClient("3")
+ok("a count that is not 0 is just the count",
+   on(cc).console_print({"device": "x", "menu": "ip route", "count_only": True,
+                         "where": ["active"]}).splitlines()[1:] == ["3"])
 
 
 # --- export filter, ping_watch, on_devices, snapshots ---------------------------

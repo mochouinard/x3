@@ -163,16 +163,30 @@ PRINT_MENUS: dict[str, str] = {
 }
 
 _FIELD = r"[a-z][a-z0-9.-]{0,63}"
-#: A value typed bare: an address, a number, a name. Nothing the console
-#: reads as an operator, a variable or a command.
-_BARE_VALUE = re.compile(r"[A-Za-z0-9._:/@+-]{1,128}")
-#: A value typed in double quotes. Inside quotes the router still evaluates
-#: ``$``, ``[...]`` and ``\\``, and ``?`` opens help at the terminal, so none
-#: of those (nor a quote) may appear.
-_QUOTED_VALUE = re.compile(r"[A-Za-z0-9 ._:/@+,()-]{1,128}")
-_COND_EQ = re.compile(rf"({_FIELD})\s*(!=|=)\s*(.+)")
-_COND_IN = re.compile(rf"(\S+)\s+in\s+(\S+)")
+_COND_OP = re.compile(rf"({_FIELD})\s*(!=|=|~)\s*(.+)")
+_COND_IN = re.compile(r"(\S+)\s+in\s+(\S+)")
 _COND_FLAG = re.compile(rf"(!?)\s*({_FIELD})")
+_YES, _NO = frozenset({"yes", "true"}), frozenset({"no", "false"})
+
+
+def quote(text: str) -> str:
+    """``text`` as a console string literal that is only ever that text.
+
+    Inside double quotes the console still reads ``\\`` escapes and ``$``
+    variables, and at a terminal ``?`` opens help; each is written in its
+    escaped form (``\\\\``, ``\\$``, ``\\3F``), after which nothing in the
+    literal is evaluated: brackets and braces inside quotes are plain text
+    (``:put "a[:put 1]b"`` prints ``a[:put 1]b``; checked on 7.19.4 and
+    7.23.3). Control characters and non-ASCII are refused: they would be
+    keystrokes, not text.
+    """
+    if not text or any(not " " <= ch <= "~" for ch in text) or len(text) > 200:
+        raise ToolError(
+            f"The value {text[:40]!r} cannot be typed at a console: plain ASCII, "
+            "1 to 200 characters."
+        )
+    return '"' + (text.replace("\\", "\\\\").replace('"', '\\"')
+                  .replace("$", "\\$").replace("?", "\\3F")) + '"'
 
 
 def print_menu(value: object) -> str:
@@ -203,26 +217,27 @@ def _network(text: str) -> str:
         raise ToolError(f"{text!r} is not an address or prefix.") from None
 
 
-def _value(text: str) -> str:
+def _unquoted(text: str) -> str:
     text = text.strip()
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
-        text = text[1:-1]
-    if _BARE_VALUE.fullmatch(text):
-        return text
-    if _QUOTED_VALUE.fullmatch(text):
-        return f'"{text}"'
-    raise ToolError(
-        f"The value {text!r} has characters this tool will not type at a "
-        "console ($ [ ] \\ \" ? and control characters are refused)."
-    )
+        return text[1:-1]
+    return text
 
 
 def condition(text: object) -> str:
     """One where-condition, rebuilt from its checked parts:
 
-    ``field=value`` / ``field!=value``, ``field in 10.0.0.0/8`` (field's
-    address inside the prefix), ``10.1.2.3 in field`` (field's prefix
-    covers the address), ``flag`` or ``!flag`` (``active``, ``!disabled``).
+    ``field=value`` / ``field!=value``, ``field~regex``,
+    ``field in 10.0.0.0/8`` (field's address inside the prefix),
+    ``10.1.2.3 in field`` (field's prefix covers the address), ``flag`` or
+    ``!flag`` (``active``, ``!disabled``).
+
+    A value is always typed quoted. Bare, ``dst-address=203.0.113.0/24``
+    matches nothing on a firewall menu and ``address=192.0.2.1/24`` nothing
+    on /ip address, without a word from the router; quoted, both match, and
+    so does every case where the bare form worked. A yes/no value matches
+    neither way: it is the flag form the router reads, so ``disabled=no``
+    is typed as ``!disabled``.
     """
     raw = str(text or "").strip()
     m = _COND_IN.fullmatch(raw)
@@ -232,17 +247,21 @@ def condition(text: object) -> str:
             return f"{left} in {_network(right)}"
         if re.fullmatch(_FIELD, right) and not re.fullmatch(_FIELD, left):
             return f"{_network(left)} in {right}"
-    m = _COND_EQ.fullmatch(raw)
+    m = _COND_OP.fullmatch(raw)
     if m:
         field, op, value = m.groups()
-        return f"{field}{op}{_value(value)}"
+        value = _unquoted(value)
+        if op != "~" and value.lower() in _YES | _NO:
+            wanted = (value.lower() in _YES) == (op == "=")
+            return field if wanted else f"!{field}"
+        return f"{field}{op}{quote(value)}"
     m = _COND_FLAG.fullmatch(raw)
     if m:
         bang, field = m.groups()
         return f"{bang}{field}"
     raise ToolError(
         f"Cannot read the condition {raw!r}. Use field=value, field!=value, "
-        "'field in 10.0.0.0/8', '10.1.2.3 in field', 'flag' or '!flag'."
+        "field~regex, 'field in 10.0.0.0/8', '10.1.2.3 in field', 'flag' or '!flag'."
     )
 
 

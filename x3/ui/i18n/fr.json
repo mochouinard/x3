@@ -7205,7 +7205,7 @@
   "Found:": "Trouvé :",
   "(no summary)": "(aucun résumé)",
   "<b>Checklist</b>, run after the change. All must pass, or it is reverted:": "<b>Vérifications</b>, faites après le changement. Toutes doivent réussir, sinon il est annulé :",
-  "<b>Commands</b>, typed at the console exactly as shown:": "<b>Commandes</b>, tapées à la console exactement comme affichées :",
+  "<b>Commands</b>, run at the console exactly as shown:": "<b>Commandes</b>, exécutées à la console exactement comme affichées :",
   "<b>What for</b>": "<b>But</b>",
   "Approve and run": "Approuver et exécuter",
   "Commands": "Commandes",

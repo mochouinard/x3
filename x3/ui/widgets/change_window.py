@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -36,6 +37,9 @@ from PySide6.QtWidgets import (
 from ...mcp import change as C
 from .. import qthreads
 from ..i18n import trf, verbatim
+
+#: How much wider the window gets when the steps appear beside the proposal.
+WATCH_WIDTH = 620
 
 #: Approve and its neighbours stay dead this long after the window appears,
 #: so a key already on its way to another window cannot approve anything.
@@ -100,19 +104,27 @@ class ChangeWindow(QDialog):
         self.setWindowTitle(trf("x3: change proposed for {device}", device=job["device"]))
         self.setMinimumWidth(720)
 
-        root = QVBoxLayout(self)
-        root.setSpacing(10)
-        root.addWidget(self._heading())
-        root.addWidget(self._described(), 1)
-        root.addWidget(_rule())
-        # One of the two is on screen at a time: deciding, then watching.
-        # Hidden rather than stacked, so the window is as tall as what it
-        # shows and not as tall as the page it does not.
+        # What is proposed on the left, for as long as the window is open.
+        # What happens to it on the right, once approved: the steps get the
+        # full height of the window there, where under the proposal they had
+        # a few lines.
+        proposal = QWidget()
+        left = QVBoxLayout(proposal)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(10)
+        left.addWidget(self._heading())
+        left.addWidget(self._described(), 1)
+        left.addWidget(_rule())
         self._decide = self._decision_page()
+        left.addWidget(self._decide)
         self._watch = self._progress_page()
         self._watch.hide()
-        root.addWidget(self._decide)
-        root.addWidget(self._watch, 2)
+        self._split = QSplitter(Qt.Orientation.Horizontal)
+        self._split.setChildrenCollapsible(False)
+        self._split.addWidget(proposal)
+        self._split.addWidget(self._watch)
+        root = QVBoxLayout(self)
+        root.addWidget(self._split)
 
         self._beat = QTimer(self)
         self._beat.setInterval(4000)
@@ -159,7 +171,7 @@ class ChangeWindow(QDialog):
         lay.addWidget(summary)
         lay.addSpacing(4)
 
-        lay.addWidget(QLabel("<b>Commands</b>, typed at the console exactly as shown:"))
+        lay.addWidget(QLabel("<b>Commands</b>, run at the console exactly as shown:"))
         self.commands = QPlainTextEdit()
         self.commands.setReadOnly(True)
         self.commands.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
@@ -256,7 +268,10 @@ class ChangeWindow(QDialog):
         self._save()
         self._decide.hide()
         self._watch.show()
-        self.resize(self.width(), max(self.height(), self.sizeHint().height()))
+        # Room for the steps beside the proposal, not instead of it.
+        was = self.width()
+        self.resize(was + WATCH_WIDTH, max(self.height(), 560))
+        self._split.setSizes([was, WATCH_WIDTH])
         run = self._make_run(self.job, self._from_run, self._cancel)
         self._worker = _RunWorker(run, self)
         self._worker.progress.connect(self._on_progress)
@@ -268,7 +283,7 @@ class ChangeWindow(QDialog):
     def _progress_page(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setContentsMargins(10, 0, 0, 0)
         self.state = QLabel("Running")
         self.state.setStyleSheet("font-weight: bold;")
         self.state.setAccessibleName("State of the change")
@@ -279,7 +294,7 @@ class ChangeWindow(QDialog):
         self.log.setReadOnly(True)
         self.log.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self.log.setAccessibleName("Steps")
-        self.log.setMinimumHeight(190)
+        self.log.setMinimumWidth(420)
         lay.addWidget(self.log, 1)
         buttons = QHBoxLayout()
         self.revert_btn = QPushButton("Revert now")

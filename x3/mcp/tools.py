@@ -366,7 +366,21 @@ class ToolBox:
         check = {
             "type": "object",
             "properties": {
-                "type": {"type": "string", "enum": ["ping", "rows"]},
+                "type": {"type": "string", "enum": ["ping", "rows", "export"],
+                         "description": "ping: from the router. rows: how many rows "
+                                        "a console_print would return. export: how "
+                                        "many lines of the config export match a "
+                                        "regular expression; use it to prove a line "
+                                        "exists or is gone without depending on a "
+                                        "menu's field names."},
+                "match": {"type": "string",
+                          "description": "export: a regular expression (Python "
+                                         "syntax, any case) tried on each export "
+                                         "line, e.g. 'chain=srcnat.*dst-address="
+                                         "203\\.0\\.113\\.0/24'."},
+                "section": {"type": "string",
+                            "description": "export: only lines under this menu, "
+                                           "e.g. '/ip firewall nat'."},
                 "name": {"type": "string", "description": "What this check proves, in a few words."},
                 "within_s": {"type": "integer", "minimum": 0, "maximum": chg.MAX_WITHIN_S,
                              "description": "Keep trying this long before it counts "
@@ -386,10 +400,10 @@ class ToolBox:
                           "description": "rows: console_print conditions, e.g. "
                                          "['name=upstream-1', 'established']."},
                 "min": {"type": "integer", "minimum": 0,
-                        "description": "rows: fewest matching rows that pass. "
+                        "description": "rows/export: fewest matches that pass. "
                                        "Default 1 when max is not given."},
                 "max": {"type": "integer", "minimum": 0,
-                        "description": "rows: most matching rows that pass; 0 "
+                        "description": "rows/export: most matches that pass; 0 "
                                        "proves something is gone."},
             },
             "required": ["type"],
@@ -413,7 +427,16 @@ class ToolBox:
                                "the scheduler are not changed this way. Write the "
                                "checklist to prove the change worked AND that "
                                "nothing else broke (the upstream still pings, the "
-                               "BGP sessions are still established).",
+                               "BGP sessions are still established). The "
+                               "checklist is also run once before the change: a "
+                               "check meant to pass only afterwards should FAIL "
+                               "there, and one that already passes proves "
+                               "nothing. A revert does not rest on Safe Mode's "
+                               "undo alone, which leaves some changes in place "
+                               "(a disabled firewall rule; on some versions an "
+                               "added route): x3 removes what an add made and "
+                               "restores what an enable or disable changed, and "
+                               "reports any line still different.",
                 "inputSchema": {"type": "object", "properties": {
                     "device": device,
                     "summary": {"type": "string",
@@ -437,9 +460,10 @@ class ToolBox:
                 "name": "change_status",
                 "description": "Where a proposed change stands: waiting for the "
                                "user, rejected (with their note), running, kept, "
-                               "reverted, or not confirmed; with the checklist "
-                               "results before and after, and what changed in "
-                               "the export.",
+                               "reverted, or not confirmed; with each command's "
+                               "own result, the checklist before and after, what "
+                               "changed in the export, and after a revert "
+                               "anything still different from before.",
                 "inputSchema": {"type": "object", "properties": {
                     "id": {"type": "string", "description": "From propose_change."},
                     "wait_s": {"type": "integer", "minimum": 0, "maximum": 55,
@@ -639,7 +663,11 @@ class ToolBox:
                                              "'dst-address in 10.0.0.0/8', "
                                              "'10.1.2.3 in dst-address' (the "
                                              "routes covering an address), "
-                                             "'active', '!disabled'."},
+                                             "'interface~^vrrp' (a regular "
+                                             "expression), 'active', "
+                                             "'!disabled'. Values are typed "
+                                             "quoted, which is the form every "
+                                             "menu matches."},
                     "detail": {"type": "boolean",
                                "description": "'print detail' instead of "
                                               "terse: every field, wrapped "
@@ -1067,6 +1095,12 @@ class ToolBox:
                            "output.keep-sent-attributes=yes; without it the router "
                            "records nothing here, whatever it sends.")
             return "\n".join(out)
+        if where and bool(args.get("count_only")) and [ln.strip() for ln in lines] == ["0"]:
+            # The same silence as an empty print: 0 is also what a field the
+            # menu does not have comes to.
+            return "\n".join([head, "0", "# 0 is also what the router answers for a field "
+                              "name this menu does not have: check the names with "
+                              "detail=true and no where."])
         if len(lines) > most:
             return "\n".join([head, f"# first {most} of {len(lines)} lines", *lines[:most]])
         return "\n".join([head, *lines])

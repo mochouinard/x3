@@ -109,11 +109,16 @@ c = C.check_check({"type": "rows", "menu": "bgp session", "where": ["established
                    "min": 2, "within_s": 120})
 check("a rows check, in words",
       c["name"], "/routing bgp session: at least 2 row(s) where established, within 120s")
+check("a value in a check is typed as a literal: quoted, with $ and ? escaped",
+      C.check_check({"type": "rows", "menu": "ip firewall nat",
+                     "where": ["dst-address=203.0.113.0/24", "comment~end$", "disabled=no"]})["where"],
+      ['dst-address="203.0.113.0/24"', 'comment~"end\\$"', "!disabled"])
 check("a ping check defaults to no loss of five",
       C.check_check({"type": "ping", "address": "192.0.2.9"})["name"],
       "ping 192.0.2.9: at most 0% of 5 lost")
 for bad in [{"type": "script"}, {"type": "ping", "address": "x; y"},
-            {"type": "rows", "menu": "/file"}, {"type": "rows", "menu": "ip route", "where": ["a=$b"]},
+            {"type": "rows", "menu": "/file"}, {"type": "rows", "menu": "ip route", "where": ["a b c"]},
+            {"type": "export"}, {"type": "export", "match": "("},
             "ping 1.1.1.1"]:
     try:
         C.check_check(bad)
@@ -124,13 +129,33 @@ for bad in [{"type": "script"}, {"type": "ping", "address": "x; y"},
 
 # --- a router in memory -------------------------------------------------------------
 
+import re  # noqa: E402
+
+_COMBINED = re.compile(
+    r':local i \[(?P<cmd>.*)\]; /system scheduler set \[find name=(?P<name>\S+)\] '
+    r'on-event=\("(?P<pre>.*)" \. \$i \. "(?P<post>.*)"\); :put \$i')
+_GET = re.compile(r':put \[(?P<menu>/[a-z -]+) get (?P<id>\*[0-9A-F]+) disabled\]')
+_EACH = re.compile(r':foreach i in=\[(?P<menu>/[a-z -]+) find (?P<cond>[^\]]+)\] do=')
+_ONE = re.compile(r':put \("(?P<id>\*[0-9A-F]+) " \. \[(?P<menu>/[a-z -]+) get')
+
+
 class Router:
-    """Config lines, and Safe Mode as a list of ways back."""
+    """Objects with ids, a scheduler entry, and Safe Mode as a list of ways
+    back. ``gaps`` names what this router's undo does not take back, the way
+    real ones do not: "add /ip route" (7.19.4), "disabled /ip firewall filter"."""
 
     def __init__(self, version="7.21.1"):
         self.version = version
-        self.config = ["/ip address add address=10.0.0.1/24 interface=ether1"]
+        self.objects = [
+            {"id": "*1", "menu": "/ip address", "disabled": False,
+             "line": "/ip address add address=10.0.0.1/24 interface=ether1"},
+            {"id": "*2", "menu": "/ip firewall filter", "disabled": False,
+             "line": "/ip firewall filter add chain=input action=accept comment=mgmt"},
+        ]
+        self.next_id = 3
+        self.timer: dict | None = None
         self.floating: list = []          # undo closures, oldest first
+        self.gaps: set[str] = set()
         self.safe = False
         self.typed: list[str] = []
         self.refuse: dict[str, str] = {}  # command -> what the console says
@@ -142,15 +167,86 @@ class Router:
         self.released = self.unrolled = self.dropped = 0
         self.opened: list[bool] = []
 
+    @property
+    def config(self) -> list[str]:
+        out = [o["line"] + (" disabled=yes" if o["disabled"] else "") for o in self.objects]
+        if self.timer is not None:
+            out.append(f"/system scheduler add name={self.timer['name']}")
+        return out
+
+    def _record(self, undo, gap=""):
+        if self.safe:
+            self.floating.append((lambda: None) if gap in self.gaps else undo)
+
     def unroll(self):
         while self.floating:
             self.floating.pop()()
         self.safe = False
 
+    def execute(self, command: str) -> str:
+        """One console command, as the router would run it. Returns what it prints."""
+        m = re.fullmatch(r'/system scheduler add name=(\S+) interval=\d+s on-event="(.*)" comment=".*"', command)
+        if m:
+            self.timer = {"name": m.group(1), "script": m.group(2)}
+            self._record(lambda: setattr(self, "timer", None))
+            return ""
+        m = re.fullmatch(r'/system scheduler set \[find name=(\S+)\] on-event="(.*)"', command)
+        if m:
+            if self.timer is not None:
+                old = self.timer["script"]
+                self.timer["script"] = m.group(2)
+                self._record(lambda: self.timer and self.timer.update(script=old))
+            return ""
+        if re.fullmatch(r"/system scheduler remove \[find name=\S+\]", command):
+            if self.timer is not None:
+                old, self.timer = self.timer, None
+                self._record(lambda: setattr(self, "timer", old))
+            return ""
+        m = re.fullmatch(r"(/[a-z -]+) remove (\*[0-9A-F]+)", command)
+        if m:
+            obj = next((o for o in self.objects if o["id"] == m.group(2) and o["menu"] == m.group(1)), None)
+            if obj is None:
+                return "no such item"
+            at = self.objects.index(obj)
+            self.objects.remove(obj)
+            self._record(lambda: self.objects.insert(at, obj))
+            return ""
+        m = re.fullmatch(r"(/[a-z -]+) set (\*[0-9A-F]+) disabled=(yes|no)", command)
+        if m:
+            obj = next((o for o in self.objects if o["id"] == m.group(2) and o["menu"] == m.group(1)), None)
+            if obj is None:
+                return "no such item"
+            old = obj["disabled"]
+            obj["disabled"] = m.group(3) == "yes"
+            self._record(lambda: obj.update(disabled=old), f"disabled {m.group(1)}")
+            return ""
+        m = re.fullmatch(r"(/[a-z -]+) (enable|disable) \[find (\S+)\]", command)
+        if m:
+            for obj in [o for o in self.objects if o["menu"] == m.group(1) and m.group(3) in o["line"]]:
+                old = obj["disabled"]
+                obj["disabled"] = m.group(2) == "disable"
+                self._record(lambda obj=obj, old=old: obj.update(disabled=old), f"disabled {m.group(1)}")
+            return ""
+        m = re.fullmatch(r"(/[a-z -]+) add .*", command)
+        if m:
+            obj = {"id": f"*{self.next_id:X}", "menu": m.group(1), "disabled": False, "line": command}
+            self.next_id += 1
+            self.objects.append(obj)
+            if command not in self.unrecorded:
+                self._record(lambda: obj in self.objects and self.objects.remove(obj), f"add {m.group(1)}")
+            return obj["id"]
+        raise AssertionError(f"the test router does not know this command: {command}")
+
     def timer_fires(self):
-        """The scheduler entry runs /safe-mode unroll: everything goes back,
-        the timer with it, and the path comes back with the old config."""
-        self.unroll()
+        """The scheduler entry runs its script: Safe Mode's rollback, then
+        each of the run's own ways back. The path comes back with it."""
+        script = self.timer["script"] if self.timer else "/safe-mode unroll"
+        for step in script.split("; "):
+            if step == "/safe-mode unroll":
+                self.unroll()
+                continue
+            m = re.fullmatch(r":do \{(.*)\} on-error=\{\}", step)
+            self.execute(m.group(1))
         self.cut = False
 
 
@@ -196,6 +292,8 @@ class Client:
 
     def drop_session(self):
         self.r.dropped += 1
+        if not self.r.cut:
+            self.r.unroll()       # the router sees the session go, and rolls back
 
     def close(self):
         # What DeviceClient.close does with Safe Mode still held: releases,
@@ -218,22 +316,37 @@ class Client:
             return said(f"sent={n} received={got} packet-loss={100 - 100 * got // n}%")
         if " print count-only" in command:
             return said(str(r.rows.get(command.split(" print")[0], 0)))
+        m = _GET.fullmatch(command)
+        if m:
+            obj = next((o for o in r.objects if o["id"] == m["id"] and o["menu"] == m["menu"]), None)
+            return said("no such item" if obj is None else str(obj["disabled"]).lower())
+        m = _EACH.match(command) or _ONE.match(command)
+        if m:
+            if "cond" in m.groupdict():
+                objs = [o for o in r.objects if o["menu"] == m["menu"] and m["cond"] in o["line"]]
+            else:
+                objs = [o for o in r.objects if o["menu"] == m["menu"] and o["id"] == m["id"]]
+            return said("\n".join(f"{o['id']} {str(o['disabled']).lower()}" for o in objs))
         assert self.write, f"a change typed on a read-only session: {command}"
-        assert r.safe, f"a change typed outside Safe Mode: {command}"
+        m = _COMBINED.fullmatch(command)
+        if m:
+            assert r.safe, f"a change typed outside Safe Mode: {command}"
+            inner = m["cmd"]
+            if inner in r.refuse:
+                return said(r.refuse[inner])
+            new_id = r.execute(inner)
+            r.execute(f'/system scheduler set [find name={m["name"]}] on-event="{m["pre"]}{new_id}{m["post"]}"')
+            if inner in r.cuts:
+                r.cut = True
+                return said("", complete=False)
+            return said(new_id)
         if command in r.refuse:
             return said(r.refuse[command])
+        text = r.execute(command)
         if command in r.cuts:
             r.cut = True
             return said("", complete=False)
-        if command.startswith("/system scheduler remove"):
-            line = next(x for x in r.config if x.startswith("/system scheduler add"))
-            r.config.remove(line)
-            r.floating.append(lambda: r.config.append(line))
-            return said()
-        r.config.append(command)
-        if command not in r.unrecorded:
-            r.floating.append(lambda: r.config.remove(command))
-        return said()
+        return said(text)
 
 
 ADD = "/ip address add address=192.0.2.1/24 interface=ether2"
@@ -268,9 +381,19 @@ check("released once, never discarded", (r.released, r.unrolled, r.dropped), (1,
 writes = [t for t in r.typed if not t.startswith("/ping")]
 ok("the revert timer is the first thing typed under Safe Mode, the removal the last",
    writes[0].startswith("/system scheduler add name=x3-change-")
-   and 'on-event="/safe-mode unroll"' in writes[0]
-   and writes[1] == ADD and writes[2].startswith("/system scheduler remove [find name=x3-change-"),
+   and 'on-event="/safe-mode unroll; ' in writes[0]
+   and writes[-1].startswith("/system scheduler remove [find name=x3-change-"),
    writes)
+ok("an add is one line: the add, its own removal into the timer, and the new id",
+   writes[1].startswith(f":local i [{ADD}]; /system scheduler set [find name=x3-change-")
+   and ":do {/ip address remove \" . $i . \"} on-error={}" in writes[1]
+   and writes[1].endswith(":put $i"), writes[1])
+ok("the timer's script ends by removing the timer itself",
+   writes[0].split('on-event="')[1].split('"')[0].endswith(
+       ":do {/system scheduler remove [find name=" + writes[0].split("name=")[1].split()[0] + "]} on-error={}"),
+   writes[0])
+check("each command is reported, with what it added",
+      res["commands"], [{"n": 1, "command": ADD, "ok": True, "said": "added *3"}])
 check("the order of the run", [s for i, s in enumerate(steps) if i == 0 or steps[i - 1] != s],
       ["connect", "baseline", "snapshot", "safe-mode", "timer", "apply", "check", "keep"])
 check("the report carries what the export gained", res["diff"], ["+" + ADD])
@@ -288,7 +411,9 @@ check("a failed check: reverted", res["status"], C.REVERTED)
 check("and the config is exactly what it was", r.config, before)
 check("discarded, not released", (r.released, r.unrolled), (0, 1))
 ok("the reason names the check", "check failed" in res["why"], res["why"])
-ok("the revert was checked against the snapshot", res["revert"] == {"orderly": True, "verified": "same"})
+ok("the revert was checked against the snapshot, and the undo had done it all",
+   res["revert"] == {"orderly": True, "verified": "same", "repaired": []}, res["revert"])
+ok("no timer is left on the router", r.timer is None)
 
 r = Router()
 second = "/ip address add address=192.0.2.2/24 interface=nosuch"
@@ -304,11 +429,97 @@ ok("the checklist is not run on a change that did not apply", res["checks"] == [
 
 r = Router()
 r.unrecorded.add(ADD)
+before = list(r.config)
 res, _ = run(r)
-check("a command History records nothing for: reverted, not trusted", res["status"], C.UNCERTAIN)
-ok("and it says Safe Mode could not vouch for it", "no undoable change" in res["why"], res["why"])
-ok("the leftover is reported as a config that still differs",
-   res["revert"]["verified"] == "differs")
+ok("a command History records nothing for is not trusted: the run stops there",
+   res["status"] == C.REVERTED and "no undoable change" in res["why"], res)
+ok("and what it added is removed by id, since no undo will",
+   r.config == before and res["revert"]["repaired"] == [
+       "removed /ip address *3: Safe Mode's undo had left it in place"], res["revert"])
+
+# --- what Safe Mode's undo does not take back ------------------------------------------------
+
+ROUTE = "/ip route add dst-address=10.4.0.0/16 gateway=10.0.0.254"
+FW_OFF = "/ip firewall filter disable [find comment=mgmt]"
+
+r = Router()
+r.gaps = {"add /ip route", "disabled /ip firewall filter"}
+r.unreachable_ping.add("192.0.2.9")
+before = list(r.config)
+res, _ = run(r, job_for(commands=(ROUTE, FW_OFF, ADD)))
+check("an undo that leaves a route and a disabled rule: still reverted", res["status"], C.REVERTED)
+check("with the router exactly as it was", r.config, before)
+check("and the run says what it had to undo itself",
+      res["revert"]["repaired"],
+      ["set /ip firewall filter *2 back to disabled=no: Safe Mode's undo had not restored it",
+       "removed /ip route *3: Safe Mode's undo had left it in place"])
+writes = [t for t in r.typed if not t.startswith("/ping")]
+at = next(i for i, t in enumerate(writes) if t == FW_OFF)
+ok("the state a disable is about to change is in the timer before the disable is typed",
+   writes[at - 1].startswith("/system scheduler set [find name=x3-change-")
+   and ":do {/ip firewall filter set *2 disabled=no} on-error={}" in writes[at - 1]
+   and writes[at - 2].startswith(":foreach i in=[/ip firewall filter find comment=mgmt]"), writes[at - 2:at + 1])
+ok("the report lists it", "undone by x3 itself: removed /ip route *3" in C.report(
+    {**job_for(), "status": res["status"], "result": res}))
+
+r = Router()
+r.gaps = {"add /ip route", "disabled /ip firewall filter"}
+CUT = "/ip address add address=192.0.2.77/24 interface=ether1"
+r.cuts.add(CUT)
+before = list(r.config)
+scripts, naps = [], []
+
+
+def timer_fires_on_third_nap(seconds):
+    naps.append(seconds)
+    if len(naps) == 3:
+        scripts.append(r.timer["script"])
+        r.timer_fires()
+
+
+res, _ = run(r, job_for(commands=(ROUTE, FW_OFF, CUT)), sleep=timer_fires_on_third_nap)
+check("the same gaps, and the path cut: the router's timer alone puts it all back",
+      (res["status"], r.config), (C.REVERTED, before))
+ok("because the timer carried the ways back, newest first, the cutting add's own included",
+   scripts and scripts[0].startswith(
+       "/safe-mode unroll; :do {/ip address remove *4} on-error={}; "
+       ":do {/ip firewall filter set *2 disabled=no} on-error={}; "
+       ":do {/ip route remove *3} on-error={}; :do {/system scheduler remove"), scripts)
+ok("the session that made the change never touched the router again", r.opened == [True, False], r.opened)
+
+
+class LeavesAChange(Client):
+    """A router whose undo misses something the run has no way back for."""
+
+    def safe_mode_leave(self, *, keep_changes=True):
+        super().safe_mode_leave(keep_changes=keep_changes)
+        if not keep_changes:
+            self.r.objects.append({"id": "*F0", "menu": "/ip dns", "disabled": False,
+                                   "line": "/ip dns set servers=192.0.2.53"})
+
+
+r = Router()
+r.unreachable_ping.add("192.0.2.9")
+job = job_for(commands=(ADD, "/ip address add address=192.0.2.2/24 interface=ether2"))
+r.refuse[job["commands"][1]] = "failure: already have such address"
+res = C.ChangeRun(job, connect=lambda w: LeavesAChange(r, w), emit=lambda e: None,
+                  sleep=lambda s: None, reconnect_for_s=0.0).run()
+check("something still different that nothing here can put back: not called reverted",
+      res["status"], C.UNCERTAIN)
+check("and the lines that differ are in the result", res["leftover"], ["+/ip dns set servers=192.0.2.53"])
+text = C.report({**job, "status": res["status"], "result": res})
+ok("the report shows them, and each command's own result",
+   "+/ip dns set servers=192.0.2.53" in text
+   and f"  ok    1. {ADD}" in text
+   and "  FAIL  2. /ip address add address=192.0.2.2/24 interface=ether2 -> failure: already have such address" in text,
+   text)
+
+ok("an export check counts matching lines, here and not on the router",
+   C.run_check(Client(Router(), False), C.check_check(
+       {"type": "export", "match": "chain=input.*comment=mgmt", "section": "/ip firewall filter"}))
+   == (True, "1 line(s)")
+   and C.run_check(Client(Router(), False), C.check_check(
+       {"type": "export", "match": "comment=nothere"})) == (False, "0 line(s)"))
 
 r = Router()
 cancel = threading.Event()
@@ -389,7 +600,8 @@ check("a change that cuts the connection: reverted, by the router's own timer",
 check("the session was cut, not released", (r.released, r.dropped >= 1), (0, True))
 check("and the old config was seen again before saying so", r.config, before)
 ok("looked at with a fresh read-only session", r.opened == [True, False], r.opened)
-ok("an orderly discard was not claimed", res["revert"] == {"orderly": False, "verified": "same"})
+ok("an orderly discard was not claimed",
+   res["revert"] == {"orderly": False, "verified": "same", "repaired": []}, res["revert"])
 ok("close() never ran with changes held", not getattr(r, "kept_by_close", False))
 
 r = Router()
