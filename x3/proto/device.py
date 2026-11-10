@@ -534,6 +534,14 @@ class DeviceClient:
         self._connecting = None
         # Open consoles (one per Terminal window), each on its own SYS_FROM
         self._terminals: list = []
+        #: Reuse one console for run_console and export_config instead of
+        #: opening one per command. Each open is a login in the router's
+        #: account log, and a tool that types a command a minute fills a
+        #: 1000-line memory log with logins. Off by default: the window has
+        #: its own terminals and opens one only when asked.
+        self.keep_console = False
+        self._kept_console = None
+        self._kept_sink = None
         # Per-connection transcript (see x3.proto.session_log)
         self.session_log = None
         # Audit mode: the raw frame record (see x3.proto.audit). Off unless
@@ -1140,6 +1148,49 @@ class DeviceClient:
             )
         return chan
 
+    def _console_for_command(self, rows: int, on_output):
+        """A console for one command, and whether it is fresh (needs
+        :meth:`_reach_shell` before anything is typed). With
+        :attr:`keep_console` a console left at its prompt by the previous
+        command is handed back instead of a new one."""
+        if not self.keep_console:
+            return self.open_terminal(cols=cexp.EXPORT_COLS, rows=rows, on_output=on_output), True
+        chan = self._kept_console
+        if chan is not None and chan.alive and chan in self._terminals:
+            self._kept_sink = on_output
+            return chan, False
+        self._drop_kept_console()
+        self._kept_sink = on_output
+        # The rows are fixed when the console opens, so the kept one is
+        # opened tall enough for any caller's pager.
+        chan = self.open_terminal(
+            cols=cexp.EXPORT_COLS, rows=max(rows, 500),
+            on_output=lambda data: (self._kept_sink or (lambda _d: None))(data),
+        )
+        self._kept_console = chan
+        return chan, True
+
+    def _console_done(self, chan, clean: bool) -> None:
+        """Close a command's console, or keep it if it is the kept one and
+        the command ended at the prompt. A command that timed out or was
+        refused may have left the console mid-question, so it is never
+        typed into again."""
+        if chan is self._kept_console and clean:
+            self._kept_sink = None
+            return
+        if chan is self._kept_console:
+            self._drop_kept_console()
+        else:
+            self.close_terminal(chan)
+
+    def _drop_kept_console(self) -> None:
+        chan, self._kept_console, self._kept_sink = self._kept_console, None, None
+        if chan is not None and chan in self._terminals:
+            try:
+                self.close_terminal(chan)
+            except Exception:  # noqa: BLE001 -- a dead console is closed enough
+                pass
+
     def close_terminal(self, chan) -> None:
         """Close one console and record what went through it."""
         try:
@@ -1250,9 +1301,11 @@ class DeviceClient:
                 buf.clear()
             return out
 
-        chan = self.open_terminal(cols=cexp.EXPORT_COLS, on_output=on_output)
+        chan, fresh = self._console_for_command(24, on_output)
+        clean = False
         try:
-            self._reach_shell(chan, lambda: drain(want_sentinel=False, quiet=settle))
+            if fresh:
+                self._reach_shell(chan, lambda: drain(want_sentinel=False, quiet=settle))
 
             def run(cmd: str) -> cexp.ConfigExport:
                 chan.write(cmd.encode() + b"\r")
@@ -1279,8 +1332,9 @@ class DeviceClient:
                         f"retrying as {cexp.EXPORT_COMMAND!r}"
                     )
                 result = run(cexp.EXPORT_COMMAND)
+            clean = result.complete
         finally:
-            self.close_terminal(chan)
+            self._console_done(chan, clean)
         if self.session_log is not None:
             note = (
                 f"config export ({result.command}) — {result.raw_len} B read, "
@@ -1486,10 +1540,11 @@ class DeviceClient:
                 "", last, count=1
             ).strip()
 
-        chan = self.open_terminal(cols=cexp.EXPORT_COLS, rows=rows, on_output=on_output)
+        chan, fresh = self._console_for_command(rows, on_output)
         done = False
         try:
-            self._reach_shell(chan, drain_banner)
+            if fresh:
+                self._reach_shell(chan, drain_banner)
             chan.write(command.encode() + b"\r")
             start = time.monotonic()
             seen, quiet_since = -1, start
@@ -1509,7 +1564,7 @@ class DeviceClient:
             # not this command's output.
             raw = take()
         finally:
-            self.close_terminal(chan)
+            self._console_done(chan, done)
         # parse() looks for a sentinel to call the capture complete; there is
         # none here, so completeness is the prompt's, set below.
         result = cexp.parse(raw, command=command, sentinel="\x00", split_logs=False)

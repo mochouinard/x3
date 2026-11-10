@@ -300,11 +300,16 @@ claude mcp add x3 -- x3ctl mcp      # use the full path to x3ctl if it is not on
 It serves your saved address book: `list_devices`, `list_neighbors`,
 `device_info`, `list_menus`, `read_menu`, `export_config`, `ping`,
 `traceroute`, `read_log`, `interface_traffic`, `ethernet_monitor`, `torch`,
-`system_health` and `console_print`. `console_print` covers what Winbox has no
-menu for, such as BGP advertisements or one prefix out of a full routing table,
-and prints only menus on a fixed list. Every tool is read-only, no
-model-supplied text is ever typed at a router's console, and passwords never
-appear in results.
+`system_health`, `console_print`, `ping_watch`, `on_devices`,
+`snapshot_config`, `list_snapshots` and `diff_config`. `console_print` covers
+what Winbox has no menu for, such as BGP advertisements or one prefix out of a
+full routing table, and prints only menus on a fixed list. `ping_watch` turns a
+few minutes of fast pings into a loss timeline. `diff_config` compares a saved
+export with now, or one router with another. Every tool is read-only on the
+router (`snapshot_config` writes only to this machine), no model-supplied text
+is ever typed at a router's console, and passwords never appear in results.
+Each device gets one session and one console for as long as it is in use, so
+tool calls do not fill the router's log with logins.
 
 ## Development
 

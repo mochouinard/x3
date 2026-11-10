@@ -80,8 +80,11 @@ def routing_table(value: object) -> str:
 
 
 def ping(dest: str, *, count: int, size: int | None = None, interface: str | None = None,
-         src_address: str | None = None, routing_table: str | None = None) -> str:
+         src_address: str | None = None, routing_table: str | None = None,
+         interval_ms: int | None = None) -> str:
     parts = ["/ping", f"address={dest}", f"count={count}"]
+    if interval_ms is not None:
+        parts.append(f"interval={interval_ms}ms")
     if size is not None:
         parts.append(f"size={size}")
     if interface:
@@ -287,3 +290,70 @@ def last_screen(lines: list[str], marker: str = "Columns:") -> list[str]:
     starts = [i for i, ln in enumerate(lines) if ln.lstrip().startswith(marker)]
     kept = lines[starts[-1]:] if starts else lines
     return [ln for ln in kept if not ln.lstrip().startswith("-- [")]
+
+
+# --- ping_watch -----------------------------------------------------------------
+
+_PROBE = re.compile(r"\s*(\d+)\s+(\S+)\s*(.*)")
+_RTT = re.compile(r"(\d+(?:\.\d+)?)(us|ms)\b")
+_LOST = re.compile(r"timeout|unreachable|no route|could not|packet filtered", re.I)
+
+
+def _rtt_ms(rest: str) -> float | None:
+    m = _RTT.search(rest)
+    if not m:
+        return None
+    return float(m.group(1)) / (1000.0 if m.group(2) == "us" else 1.0)
+
+
+def ping_timeline(lines: list[str], interval_ms: int) -> list[str]:
+    """``/ping`` output folded into runs of answered and lost probes, timed
+    from the first probe. Thousands of probe lines would bury the one thing
+    asked for: when replies stopped and for how long."""
+    probes: dict[int, float | None] = {}
+    summary = ""
+    for ln in lines:
+        if "sent=" in ln and "received=" in ln:
+            summary = ln.strip()
+            continue
+        m = _PROBE.fullmatch(ln)
+        if not m or m.group(2) == "HOST":
+            continue
+        seq, rest = int(m.group(1)), m.group(3)
+        rtt = None if _LOST.search(rest) else _rtt_ms(rest)
+        if rtt is None and not _LOST.search(rest):
+            continue  # a wrapped or partial line, not a probe
+        probes[seq] = rtt
+    if not probes:
+        return ["No probe lines came back.", *([summary] if summary else [])]
+    step = interval_ms / 1000.0
+    runs: list[tuple[bool, int, int, list[float]]] = []
+    for seq in sorted(probes):
+        rtt = probes[seq]
+        ok = rtt is not None
+        if runs and runs[-1][0] == ok and runs[-1][2] == seq - 1:
+            runs[-1] = (ok, runs[-1][1], seq, runs[-1][3] + ([rtt] if ok else []))
+        else:
+            runs.append((ok, seq, seq, [rtt] if ok else []))
+    lost = sum(1 for r in probes.values() if r is None)
+    out = [f"{len(probes)} probes every {interval_ms}ms: {lost} lost "
+           f"({100.0 * lost / len(probes):.1f}%), about {lost * step:.1f}s without replies"]
+    outages = [r for r in runs if not r[0]]
+    if outages:
+        worst = max(outages, key=lambda r: r[2] - r[1])
+        out.append(f"longest outage: {(worst[2] - worst[1] + 1) * step:.1f}s "
+                   f"from t={worst[1] * step:.1f}s")
+    out.append("timeline (t from the first probe):")
+    shown = runs if len(runs) <= 60 else runs[:30] + runs[-30:]
+    for i, (ok, a, b, rtts) in enumerate(shown):
+        if len(runs) > 60 and i == 30:
+            out.append(f"  ... {len(runs) - 60} runs left out ...")
+        span = f"  {a * step:7.1f}s - {(b + 1) * step:7.1f}s"
+        if ok:
+            out.append(f"{span}  ok    {b - a + 1} replies, rtt avg "
+                       f"{sum(rtts) / len(rtts):.1f}ms max {max(rtts):.1f}ms")
+        else:
+            out.append(f"{span}  LOST  {b - a + 1} probes")
+    if summary:
+        out.append(summary)
+    return out

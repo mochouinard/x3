@@ -17,6 +17,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Protocol
 
 from x3.proto import configexport as cexp
@@ -33,10 +34,12 @@ INSTRUCTIONS = (
     "x3 reads routers over the Winbox protocol, using the user's "
     "saved x3 address book. Start with list_devices; name a device by what it "
     "lists. list_menus shows what a device offers; read_menu reads one. "
-    "ping, traceroute, read_log, interface_traffic, ethernet_monitor, torch "
-    "and system_health run from the router "
+    "ping, ping_watch, traceroute, read_log, interface_traffic, "
+    "ethernet_monitor, torch and system_health run from the router "
     "itself; console_print prints what Winbox has no menu for, such as BGP "
     "advertisements, or one prefix out of a large routing table. "
+    "on_devices runs one tool on several devices; snapshot_config and "
+    "diff_config compare configs over time or between routers. "
     "Everything is read-only: this server cannot change a router. "
     "Secrets come back as <hidden>."
 )
@@ -192,6 +195,9 @@ def _open_client(conn: cs.Connection) -> DeviceClient:
     host, port = split_host_port(conn.host)
     password = "" if conn.password == _MASKED_PASSWORD else conn.password
     client = DeviceClient(host, conn.login, password, port=port, timeout=12.0, readonly=True)
+    # One console for every command this session types, not one each: each
+    # console open is a login line in the router's log.
+    client.keep_console = True
     client.connect()
     return client
 
@@ -421,6 +427,18 @@ class ToolBox:
                                 "description": "Only the lines under this "
                                                "menu, e.g. '/ip firewall' or "
                                                "'/ip/firewall/filter'."},
+                    "contains": {"type": "string",
+                                 "description": "Only lines with this text "
+                                                "(any case)."},
+                    "match": {"type": "string",
+                              "description": "Only lines matching this "
+                                             "regular expression (Python "
+                                             "syntax, any case)."},
+                    "exclude": {"type": "string",
+                                "description": "Leave out lines matching this "
+                                               "regular expression, e.g. "
+                                               "'bogon' to skip a long "
+                                               "bogon list."},
                 }, "required": ["device"]},
                 "annotations": ro,
             }, self.export_config),
@@ -577,6 +595,88 @@ class ToolBox:
                                 "required": ["device"]},
                 "annotations": ro,
             }, self.system_health),
+            ({
+                "name": "ping_watch",
+                "description": "Ping from the router for a stretch of time at "
+                               "a short interval and return a loss timeline: "
+                               "when replies stopped, for how long, and the "
+                               "round-trip times around it. For measuring a "
+                               "failover or a flapping link in seconds lost.",
+                "inputSchema": {"type": "object", "properties": {
+                    "device": device,
+                    "address": {"type": "string", "description": "IP address or host name."},
+                    "seconds": {"type": "integer", "minimum": 1, "maximum": 300,
+                                "description": "How long to ping. Default 30."},
+                    "interval_ms": {"type": "integer", "minimum": 20, "maximum": 1000,
+                                    "description": "Between probes. Default 200."},
+                    "interface": {"type": "string",
+                                  "description": "Send out of this interface."},
+                    "src_address": {"type": "string"},
+                    "routing_table": {"type": "string",
+                                      "description": "VRF or routing table."},
+                }, "required": ["device", "address"]},
+                "annotations": ro,
+            }, self.ping_watch),
+            ({
+                "name": "on_devices",
+                "description": "Run one read tool on several devices and get "
+                               "the answers together, one section per device, "
+                               "e.g. BGP sessions on four routers. A device "
+                               "that fails says why in its section; the "
+                               "others still answer.",
+                "inputSchema": {"type": "object", "properties": {
+                    "devices": {"type": "array", "items": {"type": "string"},
+                                "minItems": 1, "maxItems": MAX_FANOUT,
+                                "description": "Names from list_devices."},
+                    "tool": {"type": "string",
+                             "description": "Any tool here that takes a "
+                                            "device, e.g. 'console_print'."},
+                    "arguments": {"type": "object",
+                                  "description": "That tool's arguments, "
+                                                 "without 'device'."},
+                }, "required": ["devices", "tool"]},
+                "annotations": ro,
+            }, self.on_devices),
+            ({
+                "name": "snapshot_config",
+                "description": "Save the device's export (without secrets) on "
+                               "this machine, next to the snapshots x3 takes "
+                               "itself, for diff_config to compare later. "
+                               "Nothing is written to the router.",
+                "inputSchema": {"type": "object", "properties": {
+                    "device": device,
+                    "label": {"type": "string",
+                              "description": "A word for the file name, e.g. "
+                                             "'before-drain'."},
+                }, "required": ["device"]},
+                "annotations": {"readOnlyHint": False, "destructiveHint": False,
+                                "openWorldHint": True},
+            }, self.snapshot_config),
+            ({
+                "name": "list_snapshots",
+                "description": "The saved exports of one device, newest "
+                               "first, as names diff_config takes.",
+                "inputSchema": {"type": "object", "properties": {"device": device},
+                                "required": ["device"]},
+                "annotations": ro,
+            }, self.list_snapshots),
+            ({
+                "name": "diff_config",
+                "description": "Compare two configurations as a unified diff "
+                               "of their export lines. Each side is a device "
+                               "name (its config right now), or 'name@last' / "
+                               "'name@<snapshot>' for a saved one (see "
+                               "list_snapshots). With only 'a' given, the "
+                               "newest snapshot of it is compared with now. "
+                               "Two devices compare one router with another.",
+                "inputSchema": {"type": "object", "properties": {
+                    "a": {"type": "string"},
+                    "b": {"type": "string"},
+                    "section": {"type": "string",
+                                "description": "Only this menu, e.g. '/routing filter'."},
+                }, "required": ["a"]},
+                "annotations": ro,
+            }, self.diff_config),
         ]
 
     # --- handlers -----------------------------------------------------------
@@ -722,6 +822,9 @@ class ToolBox:
         # a prefix match.
         words = str(args.get("section") or "").replace("/", " ").split()
         section = "/" + " ".join(words).lower() if words else ""
+        # Matched here on the text that came back, never typed at the
+        # console, so any pattern is safe to take.
+        keep = _line_filter(args)
 
         def read(client: DeviceClient) -> str:
             got = client.export_config(show_sensitive=False)
@@ -739,6 +842,18 @@ class ToolBox:
                             "simply not have been reached. Try again."
                         )
                     raise ToolError(f"Nothing under {section} in this device's export.")
+            if keep is not None:
+                head = _export_header(lines)
+                # A long value (a script's source) goes on over indented
+                # lines; those belong to the command above and stay with it.
+                commands: list[list[str]] = []
+                for ln in lines[len(head):]:
+                    if commands and ln[:1].isspace():
+                        commands[-1].append(ln)
+                    else:
+                        commands.append([ln])
+                hits = [c for c in commands if keep("\n".join(c))]
+                lines = head + [f"# {len(hits)} matching command(s)"] + [ln for c in hits for ln in c]
             if not got.complete:
                 lines.append("# (capture stopped before the end: may be truncated)")
             return "\n".join(lines)
@@ -877,6 +992,176 @@ class ToolBox:
 
     def system_health(self, args: dict[str, Any]) -> str:
         return self._console(_device(args), diag.HEALTH_COMMAND, timeout=20)
+
+    def ping_watch(self, args: dict[str, Any]) -> str:
+        device = _device(args)
+        dest = diag.address(args.get("address"))
+        seconds = diag.number(args.get("seconds"), "seconds", 1, 300, 30)
+        interval = diag.number(args.get("interval_ms"), "interval_ms", 20, 1000, 200)
+        count = max(1, seconds * 1000 // interval)
+        extra = self._src_and_table(args)
+        iface_arg = args.get("interface")
+
+        def build(client: DeviceClient) -> str:
+            iface = diag.interface(iface_arg, _iface_names(client)) if iface_arg else None
+            return diag.ping(dest, count=count, interface=iface, interval_ms=interval, **extra)
+
+        command = self.source.run(device, build)
+        text = self._console(device, command, timeout=seconds + 30)
+        head, *lines = text.splitlines()
+        return "\n".join([head, *diag.ping_timeline(lines, interval)])
+
+    def on_devices(self, args: dict[str, Any]) -> str:
+        names = args.get("devices") or []
+        if isinstance(names, str):
+            names = [names]
+        names = [str(n) for n in names if str(n).strip()]
+        if not names:
+            raise ToolError("devices is required: names from list_devices.")
+        if len(names) > MAX_FANOUT:
+            raise ToolError(f"At most {MAX_FANOUT} devices in one call.")
+        tool = str(args.get("tool") or "")
+        handlers = {d["name"]: (d, fn) for d, fn in self.definitions()}
+        if tool not in handlers or "device" not in handlers[tool][0]["inputSchema"]["properties"]:
+            raise ToolError(
+                f"on_devices runs a tool that takes a device, not {tool!r}. One of: "
+                + ", ".join(n for n, (d, _f) in handlers.items()
+                            if "device" in d["inputSchema"]["properties"])
+            )
+        fn = handlers[tool][1]
+        inner = dict(args.get("arguments") or {})
+        out = []
+        for name in names:
+            try:
+                got = fn({**inner, "device": name})
+            except ToolError as e:
+                got = f"error: {e}"
+            out.append(f"=== {name}\n{got}")
+        return "\n\n".join(out)
+
+    def _snapshot_dirs(self, device: str) -> tuple[str, list[Path]]:
+        """Where this device's snapshots live, found by its address: the
+        directory name is identity_host, and the identity may have changed
+        since an older one was taken."""
+        host = self.source.run(device, lambda c: (
+            c.host if int(c.port or 8291) == 8291 else f"{c.host}:{c.port}"
+        ))
+        root = _export_root()
+        slug = _slug(host)
+        dirs = sorted(p for p in root.glob(f"*_{slug}") if p.is_dir()) if root.is_dir() else []
+        return host, dirs
+
+    def _snapshots(self, device: str) -> list[Path]:
+        _host, dirs = self._snapshot_dirs(device)
+        files = [f for d in dirs for f in d.glob("*.rsc")]
+        return sorted(files, key=lambda f: f.name, reverse=True)
+
+    def snapshot_config(self, args: dict[str, Any]) -> str:
+        device = _device(args)
+        label = str(args.get("label") or "mcp")
+        from ..ui import autoexport
+
+        def take(client: DeviceClient) -> Any:
+            got = client.export_config(show_sensitive=False)
+            if not got.complete:
+                raise ToolError("The export stopped before the end; nothing was saved.")
+            host = client.host if int(client.port or 8291) == 8291 else f"{client.host}:{client.port}"
+            who = SimpleNamespace(identity=client.info.identity or "", host=host)
+            return autoexport.store(got, session=who, reason=label)
+
+        rec = self.source.run(device, take)
+        if rec.unchanged:
+            return ("Unchanged since the last snapshot, so nothing new was "
+                    f"written. Newest: {self._snapshots(device)[0].stem}"
+                    if self._snapshots(device) else "Unchanged since the last snapshot.")
+        return f"Saved {rec.path.stem} ({rec.path})"
+
+    def list_snapshots(self, args: dict[str, Any]) -> str:
+        files = self._snapshots(_device(args))
+        if not files:
+            return "No snapshots of this device yet. snapshot_config takes one."
+        return "\n".join(f.stem for f in files[:100])
+
+    def _config_lines(self, spec: str, section: str) -> tuple[str, list[str]]:
+        name, _, snap = spec.partition("@")
+        name, snap = name.strip(), snap.strip()
+        if not name:
+            raise ToolError("Name a device, optionally with @last or @<snapshot>.")
+        if snap:
+            files = self._snapshots(name)
+            if not files:
+                raise ToolError(f"No snapshots of {name} yet.")
+            pick = files[0] if snap.lower() in ("last", "latest") else next(
+                (f for f in files if f.stem.startswith(snap) or snap in f.stem), None)
+            if pick is None:
+                raise ToolError(f"No snapshot {snap!r} of {name}. See list_snapshots.")
+            text = pick.read_text(encoding="utf-8", errors="replace")
+            label = f"{name}@{pick.stem}"
+        else:
+            got = self.source.run(name, lambda c: c.export_config(show_sensitive=False))
+            if not got.complete:
+                raise ToolError(f"The export of {name} stopped before the end. Try again.")
+            text, label = got.text, f"{name} (now)"
+        lines = cexp.redact(text).splitlines()
+        if section:
+            lines = _export_section(lines, section)
+        # The header carries the time of the export and nothing else to compare.
+        lines = [ln for ln in lines if ln.strip() and not ln.startswith("#")]
+        return label, lines
+
+    def diff_config(self, args: dict[str, Any]) -> str:
+        a = str(args.get("a") or "").strip()
+        b = str(args.get("b") or "").strip()
+        if not a:
+            raise ToolError("a is required: a device, or device@last.")
+        if not b:
+            if "@" in a:
+                raise ToolError("With a snapshot as a, name b too.")
+            a, b = f"{a}@last", a
+        words = str(args.get("section") or "").replace("/", " ").split()
+        section = "/" + " ".join(words).lower() if words else ""
+        la, ta = self._config_lines(a, section)
+        lb, tb = self._config_lines(b, section)
+        diff = list(difflib.unified_diff(ta, tb, la, lb, n=1, lineterm=""))
+        if not diff:
+            return f"No difference between {la} and {lb}" + (f" under {section}." if section else ".")
+        if len(diff) > 1000:
+            diff = diff[:1000] + [f"# ... {len(diff) - 1000} more diff lines; narrow with section"]
+        return "\n".join(diff)
+
+
+#: Devices on_devices takes in one call.
+MAX_FANOUT = 12
+
+
+def _export_root() -> Path:
+    from ..ui import autoexport
+    return autoexport.export_root()
+
+
+def _slug(text: str) -> str:
+    from ..ui import autoexport
+    return autoexport._slug(text)
+
+
+def _line_filter(args: dict[str, Any]) -> Callable[[str], bool] | None:
+    contains = str(args.get("contains") or "").lower()
+    pats = []
+    for key in ("match", "exclude"):
+        text = str(args.get(key) or "")
+        if text:
+            try:
+                pats.append(re.compile(text, re.I))
+            except re.error as e:
+                raise ToolError(f"{key} is not a regular expression: {e}") from None
+        else:
+            pats.append(None)
+    match, exclude = pats
+    if not (contains or match or exclude):
+        return None
+    return lambda ln: ((not contains or contains in ln.lower())
+                       and (match is None or bool(match.search(ln)))
+                       and (exclude is None or not exclude.search(ln)))
 
 
 #: Log lines read_log returns unless asked for more.

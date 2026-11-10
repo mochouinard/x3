@@ -627,6 +627,114 @@ check("console_print stats prints the counters view",
       cc.typed, ["/interface print stats without-paging where name=ether1"])
 
 
+# --- export filter, ping_watch, on_devices, snapshots ---------------------------
+
+from x3.proto.configexport import ConfigExport  # noqa: E402
+
+
+class ExportClient:
+    """A device whose export is whatever the test last set."""
+
+    host, port = "10.9.9.9", 8291
+    info = type("I", (), {"identity": "edge", "board": "", "architecture": ""})()
+
+    def __init__(self, text):
+        self.text = text
+
+    def export_config(self, *, command=None, show_sensitive=True):
+        assert show_sensitive is False
+        return ConfigExport(text=self.text, complete=True, command="/export terse")
+
+
+conf = "\n".join([
+    "# 2026-11-10 10:00:00 by router 7.23.3",
+    "/routing filter rule add chain=bgp-in rule=\"if (dst in 10.0.0.0/8) {reject}\" comment=bogon",
+    "/routing filter rule add chain=bgp-in rule=\"if (dst in 192.168.0.0/16) {reject}\" comment=bogon",
+    "/routing filter rule add chain=bgp-out rule=\"set distance 10; accept\"",
+    "/ip address add address=192.0.2.1/24 interface=ether1",
+])
+ec = ExportClient(conf)
+got = on(ec).export_config({"device": "x", "section": "/routing filter", "exclude": "bogon"})
+check("export exclude drops the noise and counts what is left",
+      got.splitlines()[1:], ["# 1 matching command(s)",
+                              '/routing filter rule add chain=bgp-out rule="set distance 10; accept"'])
+ec.text = conf + "\n/system script add name=fix source=\"\\\n    \\n/ip route remove 0\\\n    \\n\""
+got = on(ec).export_config({"device": "x", "contains": "fix"})
+ok("a matching command keeps its continuation lines",
+   got.splitlines()[-3:-1] == ['/system script add name=fix source="\\', "    \\n/ip route remove 0\\"], got)
+ec.text = conf
+got = on(ec).export_config({"device": "x", "contains": "ETHER1"})
+ok("export contains matches any case", got.splitlines()[-1].endswith("interface=ether1"), got)
+
+ping_out = ["SEQ HOST SIZE TTL TIME STATUS"]
+for i in range(20):
+    ping_out.append(f"  {i} 192.0.2.9 " + ("timeout" if 5 <= i < 12 else "56 64 1.5ms"))
+ping_out.append("sent=20 received=13 packet-loss=35%")
+tl = T.diag.ping_timeline(ping_out, 200)
+check("ping_watch folds probes into runs, timed",
+      [ln.split()[-3:] if "LOST" in ln else ln for ln in tl[:2]],
+      ["20 probes every 200ms: 7 lost (35.0%), about 1.4s without replies",
+       "longest outage: 1.4s from t=1.0s"])
+ok("and shows the outage between two answered stretches",
+   [("LOST" in ln, "ok" in ln.split()) for ln in tl[3:6]] == [(False, True), (True, False), (False, True)], tl)
+cc = ConsoleClient("\n".join(ping_out))
+on(cc).ping_watch({"device": "x", "address": "192.0.2.9", "seconds": 4, "interval_ms": 200})
+check("ping_watch types count and interval", cc.typed,
+      ["/ping address=192.0.2.9 count=20 interval=200ms"])
+
+class Fan:
+    def devices(self):
+        return []
+
+    def run(self, device, fn):
+        if device == "down":
+            raise ToolError("Could not connect to down: timed out")
+        return fn(ConsoleClient("temperature: 40C"))
+
+    def close(self):
+        pass
+
+
+got = T.ToolBox(Fan()).on_devices({"devices": ["rt1", "down", "rt2"], "tool": "system_health"})
+check("on_devices answers per device and a failure stays in its section",
+      [ln for ln in got.splitlines() if ln.startswith(("===", "error", "temp"))],
+      ["=== rt1", "temperature: 40C", "=== down", "error: Could not connect to down: timed out",
+       "=== rt2", "temperature: 40C"])
+try:
+    T.ToolBox(Fan()).on_devices({"devices": ["a"], "tool": "on_devices"})
+    ok("on_devices will not run itself", False)
+except ToolError:
+    ok("on_devices will not run itself", True)
+
+with tempfile.TemporaryDirectory() as tmp:
+    old_xdg = os.environ.get("XDG_DATA_HOME")
+    os.environ["XDG_DATA_HOME"] = tmp
+    try:
+        ec = ExportClient(conf)
+        box = on(ec)
+        said = box.snapshot_config({"device": "x", "label": "before"})
+        ok("snapshot_config saves into x3's own store", "-before-" in said and tmp in said, said)
+        ok("a second identical snapshot writes nothing",
+           "Unchanged" in box.snapshot_config({"device": "x"}))
+        ec.text = conf.replace("distance 10", "distance 20") + "\n/ip address add address=198.51.100.1/24 interface=ether2"
+        diff = box.diff_config({"a": "x"})
+        check("diff_config: newest snapshot against now, header ignored",
+              [ln for ln in diff.splitlines() if ln[:1] in "+-" and ln[:3] not in ("+++", "---")],
+              ['-/routing filter rule add chain=bgp-out rule="set distance 10; accept"',
+               '+/routing filter rule add chain=bgp-out rule="set distance 20; accept"',
+               "+/ip address add address=198.51.100.1/24 interface=ether2"])
+        diff = box.diff_config({"a": "x@last", "b": "x", "section": "/ip"})
+        check("and narrowed to a section",
+              [ln for ln in diff.splitlines() if ln[:1] == "+" and ln[:3] != "+++"],
+              ["+/ip address add address=198.51.100.1/24 interface=ether2"])
+        ok("list_snapshots names them", "-before-" in box.list_snapshots({"device": "x"}))
+    finally:
+        if old_xdg is None:
+            os.environ.pop("XDG_DATA_HOME", None)
+        else:
+            os.environ["XDG_DATA_HOME"] = old_xdg
+
+
 print()
 if failures:
     print(f"{len(failures)} failure(s)")
