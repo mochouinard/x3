@@ -316,7 +316,9 @@ it is in use, so tool calls do not fill the router's log with logins.
 The server cannot change a router. It can ask you to: `propose_change` opens an
 x3 window of its own with the assistant's reason, the commands exactly as they
 would be typed, and a checklist. Nothing is sent until you press **Approve and
-run**. `change_status` tells the assistant what you decided and how it went.
+run**. The window answers nothing for its first four seconds, not even Esc or
+its close button, and no button is the default: it can appear over whatever
+you were doing, and a click or a key already on its way decides nothing. `change_status` tells the assistant what you decided and how it went.
 
 An approved change runs like this:
 

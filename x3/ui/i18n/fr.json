@@ -7235,6 +7235,10 @@
   "<b>Change proposed for {device}</b> &nbsp; {login}@{host}": "<b>Changement proposé pour {device}</b> &nbsp; {login}@{host}",
   "How it runs: the configuration is saved, Safe Mode is taken, and a timer is set on the router itself that reverts everything after {seconds}s. Then the commands, then the checklist. The change is kept only if every check passes; otherwise it is reverted and the configuration compared with the saved one.": "Déroulement : la configuration est sauvegardée, le Mode sécurisé est pris, et une minuterie est réglée sur le routeur lui-même pour tout annuler après {seconds} s. Ensuite les commandes, puis les vérifications. Le changement n'est conservé que si toutes les vérifications réussissent ; sinon il est annulé et la configuration est comparée à celle sauvegardée.",
   "If this is not finished, the router reverts it by itself in {time}.": "Si ce n'est pas terminé, le routeur l'annule de lui-même dans {time}.",
-  "x3: change proposed for {device}": "x3 : changement proposé pour {device}"
+  "x3: change proposed for {device}": "x3 : changement proposé pour {device}",
+  "Buttons locked": "Boutons verrouillés",
+  "Read it first. The buttons unlock in {seconds} s.": "Lisez d'abord. Les boutons se déverrouillent dans {seconds} s.",
+  "The steps appear here once you approve.": "Les étapes s'affichent ici après votre approbation.",
+  "Waiting for your decision": "En attente de votre décision"
  }
 }

@@ -36,14 +36,18 @@ from PySide6.QtWidgets import (
 
 from ...mcp import change as C
 from .. import qthreads
-from ..i18n import trf, verbatim
+from ..i18n import tr, trf, verbatim
 
-#: How much wider the window gets when the steps appear beside the proposal.
-WATCH_WIDTH = 620
+#: The window opens this large when the screen has the room: the proposal
+#: and, beside it, the steps. It is never resized from here afterwards; a
+#: window that changes size under the pointer is one that gets misclicked.
+OPEN_SIZE = (1320, 660)
 
-#: Approve and its neighbours stay dead this long after the window appears,
-#: so a key already on its way to another window cannot approve anything.
-ARM_AFTER_MS = 1500
+#: The window answers nothing for this long after it appears: not Approve,
+#: not Reject, not Esc, not its close button. It can come up over whatever
+#: the person was doing, and a click or a key already on its way must not
+#: decide anything.
+ARM_AFTER_MS = 4000
 
 _STATE_TEXT = {
     C.KEPT: "Kept: every check passed",
@@ -101,6 +105,8 @@ class ChangeWindow(QDialog):
         self._cancel = threading.Event()
         self._close_when_done = False
         self._deadline_at: float | None = None
+        self._armed = False
+        self._arm_at = time.monotonic() + ARM_AFTER_MS / 1000
         self.setWindowTitle(trf("x3: change proposed for {device}", device=job["device"]))
         self.setMinimumWidth(720)
 
@@ -118,13 +124,24 @@ class ChangeWindow(QDialog):
         self._decide = self._decision_page()
         left.addWidget(self._decide)
         self._watch = self._progress_page()
-        self._watch.hide()
         self._split = QSplitter(Qt.Orientation.Horizontal)
         self._split.setChildrenCollapsible(False)
         self._split.addWidget(proposal)
         self._split.addWidget(self._watch)
+        # Extra width goes to the steps first: they are what runs long.
+        self._split.setStretchFactor(0, 2)
+        self._split.setStretchFactor(1, 3)
         root = QVBoxLayout(self)
         root.addWidget(self._split)
+        screen = self.screen().availableGeometry() if self.screen() is not None else None
+        width, height = OPEN_SIZE
+        if screen is not None and screen.width() > 0:
+            width, height = min(width, screen.width() - 60), min(height, screen.height() - 80)
+        self.resize(width, height)
+        self._split.setSizes([width * 9 // 20, width * 11 // 20])
+        # Keys typed at the window before anyone has looked at it land in a
+        # box that cannot be typed in.
+        self.commands.setFocus()
 
         self._beat = QTimer(self)
         self._beat.setInterval(4000)
@@ -133,7 +150,11 @@ class ChangeWindow(QDialog):
         self._tick = QTimer(self)
         self._tick.setInterval(1000)
         self._tick.timeout.connect(self._countdown)
-        QTimer.singleShot(ARM_AFTER_MS, self._arm)
+        self._lock = QTimer(self)
+        self._lock.setInterval(max(20, min(250, ARM_AFTER_MS // 2)))
+        self._lock.timeout.connect(self._arm)
+        self._lock.start()
+        self._arm()
         self._heartbeat()
 
     # --- what is proposed ----------------------------------------------------
@@ -147,12 +168,16 @@ class ChangeWindow(QDialog):
             device=_esc(self.job["device"]), login=_esc(self.job["login"]),
             host=_esc(self.job["host"])))
         title.setTextFormat(Qt.TextFormat.RichText)
+        title.setWordWrap(True)
         lay.addWidget(title)
-        lay.addWidget(QLabel("Proposed by an AI assistant through x3. Nothing is "
-                             "sent to the router unless you approve."))
+        whose = QLabel("Proposed by an AI assistant through x3. Nothing is "
+                       "sent to the router unless you approve.")
+        whose.setWordWrap(True)
+        lay.addWidget(whose)
         if self._first_time:
             new = QLabel("No change has been approved for this router before.")
             new.setStyleSheet("color: #b00020; font-weight: bold;")
+            new.setWordWrap(True)
             new.setAccessibleName("First proposal for this router")
             lay.addWidget(new)
         return box
@@ -218,17 +243,20 @@ class ChangeWindow(QDialog):
         self.remember.setVisible(self._first_time)
         lay.addWidget(self.remember)
 
+        self.lock_note = QLabel("")
+        self.lock_note.setAccessibleName("Buttons locked")
+        lay.addWidget(self.lock_note)
         buttons = QHBoxLayout()
         self.never_btn = QPushButton("Never for this router")
         self.never_btn.setToolTip("Reject this, and refuse every later proposal for "
                                   "this router without showing it.")
         self.reject_btn = QPushButton("Reject")
         self.approve_btn = QPushButton("Approve and run")
-        # Enter rejects. Approving takes a deliberate click.
-        self.reject_btn.setDefault(True)
-        self.approve_btn.setAutoDefault(False)
-        self.never_btn.setAutoDefault(False)
+        # Enter presses nothing: no button is the default, so deciding
+        # either way takes a click, or a key aimed at one button.
         for b in (self.never_btn, self.reject_btn, self.approve_btn):
+            b.setAutoDefault(False)
+            b.setDefault(False)
             b.setEnabled(False)
         self.never_btn.clicked.connect(self._never)
         self.reject_btn.clicked.connect(lambda: self._reject("rejected"))
@@ -241,6 +269,15 @@ class ChangeWindow(QDialog):
         return page
 
     def _arm(self) -> None:
+        """Count the lock down, and lift it when its time is up."""
+        left = self._arm_at - time.monotonic()
+        if left > 0:
+            self.lock_note.setText(trf("Read it first. The buttons unlock in {seconds} s.",
+                                       seconds=int(left) + 1))
+            return
+        self._lock.stop()
+        self._armed = True
+        self.lock_note.setText("")
         if self.job["status"] == C.WAITING:
             for b in (self.never_btn, self.reject_btn, self.approve_btn):
                 b.setEnabled(True)
@@ -267,11 +304,8 @@ class ChangeWindow(QDialog):
         self.job["note"] = self.note.text().strip()
         self._save()
         self._decide.hide()
-        self._watch.show()
-        # Room for the steps beside the proposal, not instead of it.
-        was = self.width()
-        self.resize(was + WATCH_WIDTH, max(self.height(), 560))
-        self._split.setSizes([was, WATCH_WIDTH])
+        self.state.setText("Running")
+        self.revert_btn.setEnabled(True)
         run = self._make_run(self.job, self._from_run, self._cancel)
         self._worker = _RunWorker(run, self)
         self._worker.progress.connect(self._on_progress)
@@ -284,7 +318,7 @@ class ChangeWindow(QDialog):
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(10, 0, 0, 0)
-        self.state = QLabel("Running")
+        self.state = QLabel("Waiting for your decision")
         self.state.setStyleSheet("font-weight: bold;")
         self.state.setAccessibleName("State of the change")
         lay.addWidget(self.state)
@@ -294,14 +328,19 @@ class ChangeWindow(QDialog):
         self.log.setReadOnly(True)
         self.log.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self.log.setAccessibleName("Steps")
-        self.log.setMinimumWidth(420)
+        self.log.setMinimumWidth(360)
+        # Not one of the calls the language tables wrap, so looked up here.
+        self.log.setPlaceholderText(tr("The steps appear here once you approve."))
         lay.addWidget(self.log, 1)
         buttons = QHBoxLayout()
         self.revert_btn = QPushButton("Revert now")
         self.revert_btn.setToolTip("Stop and undo the change. Works until it is kept.")
+        self.revert_btn.setEnabled(False)
+        self.revert_btn.setAutoDefault(False)
         self.revert_btn.clicked.connect(self._revert_now)
         self.close_btn = QPushButton("Close")
         self.close_btn.setEnabled(False)
+        self.close_btn.setAutoDefault(False)
         self.close_btn.clicked.connect(self.accept)
         buttons.addWidget(self.revert_btn)
         buttons.addStretch(1)
@@ -363,7 +402,6 @@ class ChangeWindow(QDialog):
             self.log.appendPlainText(f"          {line}")
         self.revert_btn.setEnabled(False)
         self.close_btn.setEnabled(True)
-        self.close_btn.setDefault(True)
         self._beat.stop()
         if self._close_when_done:
             self.accept()
@@ -387,7 +425,8 @@ class ChangeWindow(QDialog):
         """Esc, or the window's close button."""
         status = self.job["status"]
         if status == C.WAITING:
-            self._reject("closed the window without deciding")
+            if self._armed:        # an Esc in the first seconds was not meant for this
+                self._reject("closed the window without deciding")
             return
         if status == C.RUNNING:
             # Closing mid-change means: take it back. The window stays until
@@ -404,6 +443,9 @@ class ChangeWindow(QDialog):
             self.reject()
             return
         if self.job["status"] == C.WAITING:
+            if not self._armed:
+                event.ignore()
+                return
             self._reject("closed the window without deciding")
         qthreads.retire(self._worker)
         super().closeEvent(event)

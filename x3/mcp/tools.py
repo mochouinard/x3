@@ -58,6 +58,10 @@ IDLE_CLOSE_S = 300.0
 #: a busy edge router runs to thousands, and all of it would go into context.
 DEFAULT_ROW_LIMIT = 200
 
+#: A console command longer than this is typed behind an output marker. The
+#: terminal is 512 columns wide; well short of that, an echo comes back whole.
+LONG_LINE = 400
+
 #: A cdb read without secrets shows this in place of a password.
 _MASKED_PASSWORD = "********"
 
@@ -422,7 +426,8 @@ class ToolBox:
                                "reverted. Returns a change id at once; follow it "
                                "with change_status. Commands are full-path "
                                f"{'/'.join(sorted(chg.WRITE_VERBS))} lines, one "
-                               "change each, no scripting; a '?' is written \\3F. "
+                               "change each, no scripting; a '?' is written \\3F; "
+                               f"at most {chg.MAX_COMMAND_LEN} characters. "
                                "Users, files, packages, certificates, scripts and "
                                "the scheduler are not changed this way. Write the "
                                "checklist to prove the change worked AND that "
@@ -1000,6 +1005,14 @@ class ToolBox:
         headed by the command itself so the reader sees exactly what ran."""
 
         def read(client: DeviceClient) -> str:
+            if len(command) > LONG_LINE:
+                # Past the terminal's width the console echoes a line in
+                # pieces, and the pieces read as output: see change.marked.
+                complete, said = chg.marked(client, command, timeout=timeout)
+                lines = [ln.rstrip() for ln in cexp.redact("\n".join(said)).splitlines()]
+                if not complete:
+                    lines.append(f"# (stopped after {timeout:.0f}s: output may be partial)")
+                return "\n".join([f"# {command}", *lines])
             got = client.run_console(command, timeout=timeout)
             if got.console_error:
                 raise ToolError(f"The router refused {command!r}: {got.console_error}")

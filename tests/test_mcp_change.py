@@ -131,9 +131,17 @@ for bad in [{"type": "script"}, {"type": "ping", "address": "x; y"},
 
 import re  # noqa: E402
 
+_LEN = r':put \[:len \[/system scheduler get \[find name=\S+\] on-event\]\]'
+_HELD = r':local s \[/system scheduler get \[find name=(?P<name>\S+)\] on-event\]; '
 _COMBINED = re.compile(
-    r':local i \[(?P<cmd>.*)\]; /system scheduler set \[find name=(?P<name>\S+)\] '
-    r'on-event=\("(?P<pre>.*)" \. \$i \. "(?P<post>.*)"\); :put \$i')
+    r':local i \[(?P<cmd>.*)\]; ' + _HELD + r'/system scheduler set \[find name=\S+\] '
+    r'on-event=\("(?P<pre>.*)" \. \$i \. "(?P<post>.*)" \. \[:pick \$s 19 \[:len \$s\]\]\); '
+    r':put \$i; ' + _LEN)
+_PREPEND = re.compile(
+    _HELD + r'/system scheduler set \[find name=\S+\] '
+    r'on-event=\("(?P<pre>.*)" \. \[:pick \$s 19 \[:len \$s\]\]\); ' + _LEN)
+#: What the run types ahead of every line, and what the router prints for it.
+_MARK_TYPED, _MARK_PRINTED = ':put ("x3" . "-out"); ', "x3-out\n"
 _GET = re.compile(r':put \[(?P<menu>/[a-z -]+) get (?P<id>\*[0-9A-F]+) disabled\]')
 _EACH = re.compile(r':foreach i in=\[(?P<menu>/[a-z -]+) find (?P<cond>[^\]]+)\] do=')
 _ONE = re.compile(r':put \("(?P<id>\*[0-9A-F]+) " \. \[(?P<menu>/[a-z -]+) get')
@@ -166,6 +174,7 @@ class Router:
         self.rows: dict[str, int] = {}    # menu -> count
         self.released = self.unrolled = self.dropped = 0
         self.opened: list[bool] = []
+        self.miscount = 0                 # the router reports a script this much off
 
     @property
     def config(self) -> list[str]:
@@ -304,10 +313,17 @@ class Client:
     def run_console(self, command, *, timeout):
         self._gone()
         r = self.r
+        # A terminal echoes the line, and past its width echoes it in pieces:
+        # the capture opens with the line's own tail, which is not output.
+        typed = command
+        echo = typed[-40:] + "\n" if len(typed) > 512 else ""
+        marker = ""
+        if command.startswith(_MARK_TYPED):
+            command, marker = command[len(_MARK_TYPED):], _MARK_PRINTED
         r.typed.append(command)
 
         def said(text="", complete=True):
-            return ConfigExport(text=text, complete=complete, command=command)
+            return ConfigExport(text=echo + marker + text, complete=complete, command=typed)
 
         if command.startswith("/ping"):
             addr = command.split("address=")[1].split()[0]
@@ -335,11 +351,17 @@ class Client:
             if inner in r.refuse:
                 return said(r.refuse[inner])
             new_id = r.execute(inner)
-            r.execute(f'/system scheduler set [find name={m["name"]}] on-event="{m["pre"]}{new_id}{m["post"]}"')
+            script = m["pre"] + new_id + m["post"] + r.timer["script"][19:]
+            r.execute(f'/system scheduler set [find name={m["name"]}] on-event="{script}"')
             if inner in r.cuts:
                 r.cut = True
                 return said("", complete=False)
-            return said(new_id)
+            return said(f"{new_id}\n{len(r.timer['script']) + r.miscount}")
+        m = _PREPEND.fullmatch(command)
+        if m:
+            script = m["pre"] + r.timer["script"][19:]
+            r.execute(f'/system scheduler set [find name={m["name"]}] on-event="{script}"')
+            return said(str(len(r.timer["script"])))
         if command in r.refuse:
             return said(r.refuse[command])
         text = r.execute(command)
@@ -384,10 +406,12 @@ ok("the revert timer is the first thing typed under Safe Mode, the removal the l
    and 'on-event="/safe-mode unroll; ' in writes[0]
    and writes[-1].startswith("/system scheduler remove [find name=x3-change-"),
    writes)
-ok("an add is one line: the add, its own removal into the timer, and the new id",
-   writes[1].startswith(f":local i [{ADD}]; /system scheduler set [find name=x3-change-")
-   and ":do {/ip address remove \" . $i . \"} on-error={}" in writes[1]
-   and writes[1].endswith(":put $i"), writes[1])
+ok("an add is one line: the add, its own removal put in the timer by the router, the id",
+   writes[1].startswith(f":local i [{ADD}]; :local s [/system scheduler get [find name=x3-change-")
+   and ":do {/ip address remove \" . $i . \"} on-error={}; \" . [:pick $s 19 [:len $s]])" in writes[1]
+   and "; :put $i; :put [:len [/system scheduler get" in writes[1], writes[1])
+ok("what is typed for an add does not grow with the adds before it",
+   len(writes[1]) < len(ADD) + 330, len(writes[1]))
 ok("the timer's script ends by removing the timer itself",
    writes[0].split('on-event="')[1].split('"')[0].endswith(
        ":do {/system scheduler remove [find name=" + writes[0].split("name=")[1].split()[0] + "]} on-error={}"),
@@ -456,7 +480,7 @@ check("and the run says what it had to undo itself",
 writes = [t for t in r.typed if not t.startswith("/ping")]
 at = next(i for i, t in enumerate(writes) if t == FW_OFF)
 ok("the state a disable is about to change is in the timer before the disable is typed",
-   writes[at - 1].startswith("/system scheduler set [find name=x3-change-")
+   writes[at - 1].startswith(":local s [/system scheduler get [find name=x3-change-")
    and ":do {/ip firewall filter set *2 disabled=no} on-error={}" in writes[at - 1]
    and writes[at - 2].startswith(":foreach i in=[/ip firewall filter find comment=mgmt]"), writes[at - 2:at + 1])
 ok("the report lists it", "undone by x3 itself: removed /ip route *3" in C.report(
@@ -487,6 +511,15 @@ ok("because the timer carried the ways back, newest first, the cutting add's own
        ":do {/ip route remove *3} on-error={}; :do {/system scheduler remove"), scripts)
 ok("the session that made the change never touched the router again", r.opened == [True, False], r.opened)
 
+r = Router()
+for n in range(12):
+    r.objects.append({"id": f"*A{n:X}", "menu": "/ip firewall filter", "disabled": False,
+                      "line": f"/ip firewall filter add chain=forward comment=bulk-{n}"})
+res, _ = run(r, job_for(commands=("/ip firewall filter disable [find comment=bulk]",)))
+writes = [t for t in r.typed if t.startswith(":local s [")]
+ok("many objects' ways back go in a few to a line, never one long line",
+   res["status"] == C.KEPT and len(writes) == 3 and max(len(t) for t in writes) < 512, [len(t) for t in writes])
+
 
 class LeavesAChange(Client):
     """A router whose undo misses something the run has no way back for."""
@@ -513,6 +546,44 @@ ok("the report shows them, and each command's own result",
    and f"  ok    1. {ADD}" in text
    and "  FAIL  2. /ip address add address=192.0.2.2/24 interface=ether2 -> failure: already have such address" in text,
    text)
+
+# --- long lines, and a timer that is not what was sent -----------------------------------------
+
+LONG = "/ip address add address=192.0.2.9/24 interface=ether2 comment=\"" + "takes over " * 50 + "\""
+r = Router()
+res, _ = run(r, job_for(commands=(ADD, LONG)))
+ok("a command longer than the terminal is wide is not mistaken for its own echo",
+   res["status"] == C.KEPT and res["commands"][1] == {"n": 2, "command": LONG, "ok": True,
+                                                       "said": "added *4"}, res)
+
+
+class OldParser(Client):
+    """Checks a whole line before running any of it: a syntax error prints no
+    marker, only the message, after the echo."""
+
+    def run_console(self, command, *, timeout):
+        if "nosuchparam" in command:
+            self.r.typed.append(command)
+            column = command.index("nosuchparam") + 1
+            return ConfigExport(text=command[-60:] + f"\nbad parameter nosuchparam (line 1 column {column})",
+                                complete=True, command=command)
+        return super().run_console(command, timeout=timeout)
+
+
+r = Router()
+BAD = "/ip address add address=192.0.2.9/24 nosuchparam=1 interface=ether2"
+res = C.ChangeRun(job_for(commands=(BAD,)), connect=lambda w: OldParser(r, w),
+                  emit=lambda e: None, sleep=lambda s: None).run()
+check("a syntax error with no marker is still the router's message, its column in the command's own terms",
+      (res["status"], res["commands"][0]["said"]),
+      (C.REVERTED, f"bad parameter nosuchparam (line 1 column {BAD.index('nosuchparam') + 1})"))
+
+r = Router()
+r.miscount = 7
+before = list(r.config)
+res, _ = run(r)
+ok("a timer the router holds differently from what was sent stops the run, and it is undone",
+   res["status"] == C.REVERTED and "not what was sent" in res["why"] and r.config == before, res)
 
 ok("an export check counts matching lines, here and not on the router",
    C.run_check(Client(Router(), False), C.check_check(
@@ -568,9 +639,10 @@ timer_cmd = None
 
 class NoTimer(Client):
     def run_console(self, command, *, timeout):
-        if command.startswith("/system scheduler add"):
+        if command.removeprefix(_MARK_TYPED).startswith("/system scheduler add"):
             self.r.typed.append(command)
-            return ConfigExport(text="failure: not enough permissions", complete=True, command=command)
+            return ConfigExport(text=_MARK_PRINTED + "failure: not enough permissions",
+                                complete=True, command=command)
         return super().run_console(command, timeout=timeout)
 
 
@@ -619,10 +691,9 @@ r = Router()
 
 class TimerFiresDuringChecks(Client):
     def run_console(self, command, *, timeout):
-        if command.startswith("/ping") and self.r.safe and ADD in self.r.config:
-            self.r.unroll()   # the scheduler ran /safe-mode unroll
-        return super().run_console(command, timeout=timeout) if self.r.safe or command.startswith("/ping") \
-            else ConfigExport(text="", complete=True, command=command)
+        if command.removeprefix(_MARK_TYPED).startswith("/ping") and self.r.safe and ADD in self.r.config:
+            self.r.timer_fires()   # the scheduler ran its script
+        return super().run_console(command, timeout=timeout)
 
 
 before = list(r.config)
@@ -783,13 +854,23 @@ window_for.n = 0
 
 r = Router()
 win, job = window_for(r)
-ok("the buttons are dead when the window appears",
-   not win.approve_btn.isEnabled() and not win.reject_btn.isEnabled())
+ok("the buttons are dead when the window appears, and it says for how long",
+   not win.approve_btn.isEnabled() and not win.reject_btn.isEnabled()
+   and "unlock" in win.lock_note.text(), win.lock_note.text())
+win.reject()                     # an Esc that was on its way to another window
+win.close()                      # and a close meant for one
+ok("neither Esc nor a close decides anything while it is locked",
+   win.job["status"] == C.WAITING and win.isVisible() and C.load(job["id"])["status"] == C.WAITING)
+ok("the steps pane is there from the start, beside the proposal, waiting",
+   win.log.isVisible() and win.state.text() == "Waiting for your decision"
+   and not win.revert_btn.isEnabled())
 ok("the commands are shown as they will be typed", ADD in win.commands.toPlainText())
 spin(120)
 ok("and live a moment later", win.approve_btn.isEnabled())
-ok("Enter is Reject, never Approve",
-   win.reject_btn.isDefault() and not win.approve_btn.isDefault() and not win.approve_btn.autoDefault())
+ok("Enter presses nothing: no button is the default",
+   not any(b.isDefault() or b.autoDefault()
+           for b in (win.reject_btn, win.approve_btn, win.never_btn, win.close_btn, win.revert_btn)))
+size = win.size()
 win.note.setText("go ahead")
 win.approve_btn.click()
 ok("approved: the run ends kept", until(lambda: win.job["status"] in C.FINAL)
@@ -800,6 +881,7 @@ ok("the job file has the result, the note and the steps",
    and any(e["step"] == "timer" for e in on_disk["events"]), on_disk)
 ok("Revert is dead once it is kept, Close is live",
    not win.revert_btn.isEnabled() and win.close_btn.isEnabled())
+ok("the window is the size it opened at: approving resized nothing", win.size() == size)
 check("approving once does not open the router for good", C.policy_for(job["host"], "admin"), "")
 win.close()
 
@@ -830,6 +912,7 @@ check("Never: rejected, and the router closed to proposals",
 
 r = Router()
 win, job = window_for(r)
+spin(120)
 win.close()
 check("closing the window without deciding rejects",
       (C.load(job["id"])["status"], r.typed), (C.REJECTED, []))
