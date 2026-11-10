@@ -210,7 +210,7 @@ class ChangeWindow(QDialog):
 
         lay.addWidget(QLabel("<b>Checklist</b>, run after the change. All must pass, "
                              "or it is reverted:"))
-        checks = QLabel(verbatim("\n".join(f"  •  {c['name']}" for c in self.job["checks"])))
+        checks = QLabel(verbatim("\n".join(f"  •  {C.check_label(c)}" for c in self.job["checks"])))
         checks.setWordWrap(True)
         checks.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         lay.addWidget(checks)
@@ -394,7 +394,10 @@ class ChangeWindow(QDialog):
         self._save()
         self._tick.stop()
         self.deadline.setText("")
-        self.state.setText(_STATE_TEXT.get(status, status))  # translated on its way in
+        if status == C.KEPT and result.get("warnings"):
+            self.state.setText("Kept, with warnings: read them below")
+        else:
+            self.state.setText(_STATE_TEXT.get(status, status))
         self.state.setStyleSheet(f"font-weight: bold; color: {_STATE_COLOUR.get(status, '#000')};")
         if result.get("why"):
             self.log.appendPlainText(f"          {result['why']}")

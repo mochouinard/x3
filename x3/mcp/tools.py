@@ -386,6 +386,23 @@ class ToolBox:
                             "description": "export: only lines under this menu, "
                                            "e.g. '/ip firewall nat'."},
                 "name": {"type": "string", "description": "What this check proves, in a few words."},
+                "before": {"type": "string", "enum": ["pass", "fail"],
+                           "description": "What this check should do when run once "
+                                          "ahead of the change. 'fail': the change is "
+                                          "meant to make it pass, so failing there is "
+                                          "expected and is shown as such (and passing "
+                                          "there means it proves nothing). 'pass': it "
+                                          "guards what must not break; if it already "
+                                          "fails, the run stops before touching the "
+                                          "router. Say it for every check."},
+                "on_fail": {"type": "string", "enum": ["revert", "warn"],
+                            "description": "What a failure after the change does. "
+                                           "'revert' (default): the change is undone. "
+                                           "'warn': it is reported to the user and to "
+                                           "you, and the change is still kept if the "
+                                           "other checks pass. For things worth "
+                                           "knowing that should not undo the change. "
+                                           "At least one check must be 'revert'."},
                 "within_s": {"type": "integer", "minimum": 0, "maximum": chg.MAX_WITHIN_S,
                              "description": "Keep trying this long before it counts "
                                             "as failed, e.g. 120 for a BGP session "
@@ -1214,10 +1231,16 @@ class ToolBox:
                 "checks: at least one. A change is kept only if its checklist "
                 "passes, so say what must still work afterwards."
             )
+        checked = [chg.check_check(c) for c in checks]
+        if all(c["on_fail"] == "warn" for c in checked):
+            raise ToolError(
+                "checks: every one is a warning. At least one must be able to revert "
+                "the change, or nothing decides whether it stays."
+            )
         job = chg.new_job(
             device=device, host=conn.host, login=conn.login, summary=summary[:600],
             commands=[chg.check_command(c) for c in commands],
-            checks=[chg.check_check(c) for c in checks],
+            checks=checked,
             settle_s=diag.number(args.get("settle_s"), "settle_s", 0, chg.MAX_SETTLE_S, 5),
         )
         busy = chg.active_for(conn.host, conn.login)

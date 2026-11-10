@@ -284,6 +284,18 @@ def check_check(raw: object) -> dict[str, Any]:
 
     Each takes ``within_s``: keep trying this long before calling it
     failed (a BGP session takes a while to come back), and ``name``.
+
+    ``before`` says what the check should do when it is run once ahead of
+    the change: "fail" for one the change is meant to make pass (failing
+    there is the expected answer, not a problem), "pass" for one that guards
+    what must not break (failing there stops the run before anything is
+    touched: it would fail afterwards too, and the change be reverted for
+    nothing). Left out, the run only reports what it saw.
+
+    ``on_fail`` is "revert" (the default: failing after the change undoes
+    it) or "warn": the failure is reported, to the person and to the
+    assistant, and decides nothing. A change needs at least one check that
+    can revert it.
     """
     if not isinstance(raw, dict):
         raise ToolError("A check is an object with a 'type'.")
@@ -330,9 +342,39 @@ def check_check(raw: object) -> dict[str, Any]:
         out["max"] = None if hi is None else diag.number(hi, "max", 0, 10_000_000, 0)
     else:
         raise ToolError("A check's type is 'ping', 'rows' or 'export'.")
+    before = str(raw.get("before") or "").lower()
+    if before not in ("", "pass", "fail"):
+        raise ToolError("A check's 'before' is 'pass' or 'fail'.")
+    out["before"] = before
+    on_fail = str(raw.get("on_fail") or "revert").lower()
+    if on_fail not in ("revert", "warn"):
+        raise ToolError("A check's 'on_fail' is 'revert' or 'warn'.")
+    out["on_fail"] = on_fail
     name = str(raw.get("name") or "").strip()
     out["name"] = name[:80] if name else describe_check(out)
     return out
+
+
+def before_line(c: dict[str, Any], ok: bool, seen: str) -> tuple[str, str]:
+    """How one check's run ahead of the change reads: (mark, sentence).
+
+    The mark is "pass", "expected" (not passing yet, as the check said it
+    would not), "not yet" (not passing, and nobody said what to expect),
+    "proves nothing" (meant to fail here and already passes) or "FAIL" (a
+    guard that is already broken).
+    """
+    want = c.get("before") or ""
+    name = c["name"]
+    if ok and want == "fail":
+        return "proves nothing", (f"already passes before the change, so it will not "
+                                  f"show the change worked: {name} ({seen})")
+    if ok:
+        return "pass", f"pass: {name} ({seen})"
+    if want == "fail":
+        return "expected", f"not yet, as expected before the change: {name} ({seen})"
+    if want == "pass":
+        return "FAIL", f"FAIL: {name} ({seen})"
+    return "not yet", f"not passing before the change: {name} ({seen})"
 
 
 def describe_check(c: dict[str, Any]) -> str:
@@ -358,6 +400,18 @@ def describe_check(c: dict[str, Any]) -> str:
     if c.get("within_s"):
         text += f", within {c['within_s']}s"
     return text
+
+
+def check_label(c: dict[str, Any]) -> str:
+    """A check for the person approving: its name, and what it is there for."""
+    roles = []
+    if c.get("before") == "fail":
+        roles.append("the change should make this pass")
+    elif c.get("before") == "pass":
+        roles.append("must hold before and after")
+    if c.get("on_fail") == "warn":
+        roles.append("warning only: does not revert")
+    return c["name"] + (f"  ({'; '.join(roles)})" if roles else "")
 
 
 def deadline_s(job: dict[str, Any]) -> int:
@@ -837,11 +891,20 @@ class ChangeRun:
             self._say("connect", f"Connecting to {job['device']}")
             self.client = client = self._connect(True)
             self._say("baseline", "Running the checklist once, before the change")
+            broken = []
             for c in checks:
                 ok, seen = run_check(client, c)
-                result["baseline"].append({"name": c["name"], "ok": ok, "seen": seen})
-                self._say("baseline", f"{'pass' if ok else 'FAIL'}: {c['name']} ({seen})",
-                          ok=ok, check=c["name"])
+                mark, line = before_line(c, ok, seen)
+                result["baseline"].append({"name": c["name"], "ok": ok, "seen": seen, "mark": mark})
+                self._say("baseline", line, ok=ok, check=c["name"], mark=mark)
+                if mark == "FAIL" and c.get("on_fail") != "warn":
+                    broken.append(f"{c['name']} ({seen})")
+            if broken:
+                # A guard that fails now fails afterwards too: the change
+                # would be made and then reverted for something it did not do.
+                return NOT_APPLIED, (
+                    "Nothing was changed: a check that must hold before and after "
+                    "already fails before the change: " + "; ".join(broken) + ".")
             version = cexp.parse_version(getattr(client.info, "version", "") or "")
             if version < TIMER_NEEDS:
                 return NOT_APPLIED, (
@@ -915,7 +978,15 @@ class ChangeRun:
                 self._wait(job["settle_s"])
             for c in checks:
                 ok, seen, tries = self._check_until(client, c)
-                result["checks"].append({"name": c["name"], "ok": ok, "seen": seen, "tries": tries})
+                warn = not ok and c.get("on_fail") == "warn"
+                result["checks"].append({"name": c["name"], "ok": ok, "seen": seen,
+                                         "tries": tries, "warn": warn})
+                if warn:
+                    # Said, and kept for the report; it decides nothing.
+                    result.setdefault("warnings", []).append(f"{c['name']} ({seen})")
+                    self._say("check", f"warning, does not revert: {c['name']} ({seen})",
+                              ok=False, check=c["name"], warn=True)
+                    continue
                 self._say("check", f"{'pass' if ok else 'FAIL'}: {c['name']} ({seen})",
                           ok=ok, check=c["name"])
                 if not ok:
@@ -946,7 +1017,10 @@ class ChangeRun:
             self._timer_at = None
         except (DeviceError, OSError) as e:
             return self._undo(result, f"Safe Mode could not be left cleanly: {e}")
-        self._say("keep", "All checks passed: Safe Mode released, the change is kept")
+        warned = result.get("warnings") or []
+        self._say("keep", "Safe Mode released, the change is kept: "
+                  + ("every check passed" if not warned else
+                     f"every check that decides passed, with {len(warned)} warning(s)"))
         try:
             after = client.export_config(show_sensitive=False)
             if self._snapshot is not None:
@@ -954,6 +1028,9 @@ class ChangeRun:
             result["diff"] = _diff(self._before.text, after.text)
         except (DeviceError, OSError) as e:
             result["diff_error"] = str(e)
+        if warned:
+            return KEPT, ("Every check that decides passed. Warnings, which do not "
+                          "revert: " + "; ".join(warned) + ".")
         return KEPT, "All checks passed."
 
     def _check_until(self, client: DeviceClient, c: dict[str, Any]) -> tuple[bool, str, int]:
@@ -1091,7 +1168,8 @@ def report(job: dict[str, Any]) -> str:
         WAITING: "waiting for the user's decision in the x3 change window",
         RUNNING: "approved, running now",
         REJECTED: "REJECTED by the user; nothing was sent to the router",
-        KEPT: "KEPT: every check passed and the change is committed",
+        KEPT: ("KEPT, WITH WARNINGS: every check that decides passed and the change is committed"
+               if res.get("warnings") else "KEPT: every check passed and the change is committed"),
         REVERTED: "REVERTED: the change was undone and the config matches the snapshot taken before",
         NOT_APPLIED: "NOT APPLIED: it stopped before anything was changed",
         UNCERTAIN: "UNCERTAIN: a revert was triggered but could not be confirmed; a person must look",
@@ -1118,11 +1196,20 @@ def report(job: dict[str, Any]) -> str:
     if res.get("leftover"):
         out.append("still different from before the change (- was, + is now):")
         out += [f"  {ln}" for ln in res["leftover"]]
-    for title, key in (("before the change", "baseline"), ("after the change", "checks")):
-        rows = res.get(key) or []
-        if rows:
-            out.append(f"checklist {title}:")
-            out += [f"  {'pass' if r['ok'] else 'FAIL'}  {r['name']}: {r['seen']}" for r in rows]
+    rows = res.get("baseline") or []
+    if rows:
+        out.append("checklist before the change:")
+        words = {"pass": "pass", "FAIL": "FAIL (must hold before the change too)",
+                 "expected": "not yet (expected: the change should make it pass)",
+                 "not yet": "not passing yet",
+                 "proves nothing": "ALREADY PASSES (was meant to fail before: proves nothing)"}
+        out += [f"  {words.get(r.get('mark') or ('pass' if r['ok'] else 'not yet'))}  "
+                f"{r['name']}: {r['seen']}" for r in rows]
+    rows = res.get("checks") or []
+    if rows:
+        out.append("checklist after the change:")
+        out += [f"  {'pass' if r['ok'] else 'WARNING (does not revert)' if r.get('warn') else 'FAIL'}"
+                f"  {r['name']}: {r['seen']}" for r in rows]
     if res.get("diff"):
         out.append("what changed in the export:")
         out += [f"  {ln}" for ln in res["diff"]]

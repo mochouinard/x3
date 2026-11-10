@@ -7239,6 +7239,7 @@
   "Buttons locked": "Boutons verrouillés",
   "Read it first. The buttons unlock in {seconds} s.": "Lisez d'abord. Les boutons se déverrouillent dans {seconds} s.",
   "The steps appear here once you approve.": "Les étapes s'affichent ici après votre approbation.",
-  "Waiting for your decision": "En attente de votre décision"
+  "Waiting for your decision": "En attente de votre décision",
+  "Kept, with warnings: read them below": "Conservé, avec des avertissements : lisez-les ci-dessous"
  }
 }

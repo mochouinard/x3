@@ -422,7 +422,8 @@ check("the order of the run", [s for i, s in enumerate(steps) if i == 0 or steps
       ["connect", "baseline", "snapshot", "safe-mode", "timer", "apply", "check", "keep"])
 check("the report carries what the export gained", res["diff"], ["+" + ADD])
 ok("the checklist ran before the change too", res["baseline"] == [
-    {"name": "ping 192.0.2.9: at most 0% of 2 lost", "ok": True, "seen": "2/2 replies (0% lost)"}])
+    {"name": "ping 192.0.2.9: at most 0% of 2 lost", "ok": True, "seen": "2/2 replies (0% lost)",
+     "mark": "pass"}], res["baseline"])
 ok("one write-capable session, no other", r.opened == [True], r.opened)
 
 # --- reverted, every way -------------------------------------------------------------------
@@ -546,6 +547,89 @@ ok("the report shows them, and each command's own result",
    and f"  ok    1. {ADD}" in text
    and "  FAIL  2. /ip address add address=192.0.2.2/24 interface=ether2 -> failure: already have such address" in text,
    text)
+
+# --- what a check is expected to do before the change ----------------------------------------
+
+GUARD = {"type": "ping", "address": "192.0.2.9", "count": 2, "before": "pass", "name": "upstream answers"}
+GOAL = {"type": "rows", "menu": "ip address", "where": ["comment=new"], "before": "fail", "name": "the new address is there"}
+PLAIN = {"type": "rows", "menu": "ip route", "name": "a route, nobody said what to expect"}
+
+r = Router()
+said = []
+res, _ = run(r, job_for(checks=(GUARD, GOAL, PLAIN)), events=said)
+check("before the change: a check meant to fail there reads as expected, not as a failure",
+      [e["text"] for e in said if e["step"] == "baseline"][1:],
+      ["pass: upstream answers (2/2 replies (0% lost))",
+       "not yet, as expected before the change: the new address is there (0 row(s))",
+       "not passing before the change: a route, nobody said what to expect (0 row(s))"])
+check("and the result keeps which was which", [b["mark"] for b in res["baseline"]],
+      ["pass", "expected", "not yet"])
+text = C.report({**job_for(), "status": res["status"], "result": res})
+ok("the report says so in words",
+   "not yet (expected: the change should make it pass)  the new address is there" in text
+   and "not passing yet  a route, nobody said what to expect" in text, text)
+
+r = Router()
+r.unreachable_ping.add("192.0.2.9")
+before = list(r.config)
+res, _ = run(r, job_for(checks=(GUARD, GOAL)))
+check("a guard that already fails stops the run before anything is touched",
+      (res["status"], r.safe, r.config == before, [t for t in r.typed if not t.startswith(("/ping", "/ip address print"))]),
+      (C.NOT_APPLIED, False, True, []))
+ok("and says which check, and that it was failing before the change",
+   "upstream answers" in res["why"] and "already fails before the change" in res["why"], res["why"])
+
+r = Router()
+r.rows["/ip address"] = 1
+said = []
+res, _ = run(r, job_for(checks=(GOAL,)), events=said)
+ok("a check meant to fail before that already passes is called out: it proves nothing",
+   res["baseline"][0]["mark"] == "proves nothing"
+   and any("already passes before the change" in e["text"] for e in said), res["baseline"])
+check("a check says what it is there for, to the person approving",
+      [C.check_label(C.check_check(c)) for c in (GUARD, GOAL, PLAIN)],
+      ["upstream answers  (must hold before and after)",
+       "the new address is there  (the change should make this pass)",
+       "a route, nobody said what to expect"])
+try:
+    C.check_check({**GUARD, "before": "maybe"})
+    ok("'before' is pass or fail", False)
+except ToolError:
+    ok("'before' is pass or fail", True)
+
+# --- a check that only warns ------------------------------------------------------------------
+
+WARN = {"type": "ping", "address": "192.0.2.50", "count": 2, "on_fail": "warn", "name": "the monitor answers"}
+r = Router()
+r.unreachable_ping.add("192.0.2.50")
+said = []
+res, _ = run(r, job_for(checks=(PING, WARN)), events=said)
+check("a warning that fails does not revert: the change is kept", (res["status"], r.released, r.unrolled),
+      (C.KEPT, 1, 0))
+check("and it is in the result as a warning, not lost",
+      (res["warnings"], res["checks"][1]["warn"]), (["the monitor answers (0/2 replies (100% lost))"], True))
+ok("said as it happens, and in the reason", any(e.get("warn") for e in said)
+   and "Warnings, which do not revert: the monitor answers" in res["why"], res["why"])
+text = C.report({**job_for(), "status": res["status"], "result": res})
+ok("the report opens with it and marks the check",
+   "KEPT, WITH WARNINGS" in text and "WARNING (does not revert)  the monitor answers" in text, text)
+
+r = Router()
+r.unreachable_ping.update({"192.0.2.50", "192.0.2.9"})
+res, _ = run(r, job_for(checks=(WARN, PING)))
+check("a warning does not shield the check after it: that one still reverts", res["status"], C.REVERTED)
+
+r = Router()
+r.unreachable_ping.add("192.0.2.50")
+res, _ = run(r, job_for(checks=({**WARN, "before": "pass"}, PING)))
+check("a warning that already fails before the change does not stop the run either", res["status"], C.KEPT)
+ok("it is labelled for the person approving",
+   C.check_label(C.check_check(WARN)) == "the monitor answers  (warning only: does not revert)")
+try:
+    C.check_check({**WARN, "on_fail": "ignore"})
+    ok("'on_fail' is revert or warn", False)
+except ToolError:
+    ok("'on_fail' is revert or warn", True)
 
 # --- long lines, and a timer that is not what was sent -----------------------------------------
 
@@ -777,6 +861,13 @@ try:
     ok("one bad command refuses the whole proposal", False)
 except ToolError:
     ok("one bad command refuses the whole proposal", launched == [])
+
+try:
+    box.propose_change({**ask, "checks": [{**PING, "on_fail": "warn"}]})
+    ok("a proposal with only warnings is refused: nothing would decide", False)
+except ToolError as e:
+    ok("a proposal with only warnings is refused: nothing would decide",
+       "At least one" in str(e) and launched == [], str(e))
 
 said = box.propose_change(ask)
 job_id = launched[0]

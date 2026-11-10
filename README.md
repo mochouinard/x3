@@ -358,7 +358,12 @@ own result.
 A checklist entry is a ping from the router (`max_loss_pct`), a count of rows
 in a `console_print` menu (`min`/`max`, with the same conditions), or a count
 of export lines matching a regular expression, each with an optional
-`within_s`. A command is one `add`, `set`, `remove`, `enable`,
+`within_s`. A check can say what it should do when run ahead of the change:
+`before: fail` for one the change is meant to make pass (shown as "not yet, as
+expected" rather than as a failure), `before: pass` for one that guards what
+must not break (if it already fails, nothing is touched). `on_fail: warn` makes
+a check report without deciding: the change is kept, with warnings. At least
+one check must be able to revert. A command is one `add`, `set`, `remove`, `enable`,
 `disable`, `move`, `unset` or `comment` on a menu, written out in full: no
 scripting, no computed values, one change per line. Users, files, packages,
 certificates, scripts and the scheduler are not changed this way.
