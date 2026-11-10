@@ -1935,7 +1935,8 @@ def _add_mcp_cmd(sub) -> None:
     p = sub.add_parser(
         "mcp",
         help="Serve the saved address book and its routers to an AI assistant "
-             "over MCP (stdio). Read-only: it cannot change a router.",
+             "over MCP (stdio). Read-only: a change can only be proposed, "
+             "for you to approve in an x3 window.",
     )
     p.add_argument("--cdb", help="Addresses.cdb to read (default: the one x3 finds).")
     p.set_defaults(func=_cmd_mcp)

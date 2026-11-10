@@ -28,6 +28,14 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"x3 {__version__}")
         return 0
+    if "--change-window" in argv[1:]:
+        # A change an assistant proposed over MCP, to approve or reject (see
+        # x3.mcp.approve). Its own small window, not the connection page.
+        from ..mcp.approve import main as change_window
+
+        rest = argv[1:]
+        rest.remove("--change-window")
+        return change_window(rest)
 
     # Before anything else: a GUI has no terminal to fail into, so open the
     # log first and let it catch whatever startup does.

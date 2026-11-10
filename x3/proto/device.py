@@ -1633,6 +1633,27 @@ class DeviceClient:
             except Exception:  # noqa: BLE001
                 pass
 
+    def drop_session(self) -> None:
+        """Cut the connection with Safe Mode still held, so the router
+        unrolls it.
+
+        :meth:`close` releases Safe Mode first, which *keeps* what it holds.
+        This is the other exit: for a change that must not stay and that an
+        orderly discard could not take back. The router undoes everything
+        Safe Mode holds when its session drops (about two seconds on a
+        7.23.3 lab router).
+        """
+        self._safe_mode = None
+        self.safe_mode_active = False
+        self._kept_console = None
+        self._terminals.clear()
+        sess, self.session = self.session, None
+        if sess is not None:
+            try:
+                sess.close()
+            except Exception:  # noqa: BLE001 -- a dead socket is dropped enough
+                pass
+
     def close(self) -> None:
         self.abort()
         # Consoles first: /quit needs a live socket.

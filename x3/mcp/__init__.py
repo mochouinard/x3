@@ -16,10 +16,13 @@ window instead of from a process of their own:
     MCP itself: newline-delimited JSON-RPC on stdin/stdout. Small enough to
     keep here rather than pull in the SDK and its web stack for one transport.
 
-Read-only, on purpose. Every session is opened with ``readonly=True``, so
-DeviceClient refuses a write before it reaches the wire, whatever a tool does.
-Changes are for the in-window server, where each one waits in x3's queue for a
-person to approve it.
+Read-only, on purpose. Every session this server opens is ``readonly=True``,
+so DeviceClient refuses a write before it reaches the wire, whatever a tool
+does. What it can do is *propose* a change (:mod:`.change`): that writes a job
+file and opens the x3 change window (:mod:`.approve`), a process of its own
+with a person in front of it. Approved there, the change runs under Safe Mode
+with a revert timer on the router and a checklist, and is kept only if every
+check passes.
 
 Secrets never leave: passwords are looked up here and used here, never put in
 a tool result; fields the schema marks secret come back as ``<hidden>``; the

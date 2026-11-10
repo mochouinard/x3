@@ -135,7 +135,7 @@ A source or pip install is told the command to run instead.
 | | Linux | Windows |
 |---|---|---|
 | settings, address-book overlay | `~/.config/x3` | `%APPDATA%\x3` |
-| session logs, audit files, snapshots | `~/.local/share/x3` | `%LOCALAPPDATA%\x3\data` |
+| session logs, audit files, snapshots, proposed changes | `~/.local/share/x3` | `%LOCALAPPDATA%\x3\data` |
 | caches (parsed schemas, plugin sets) | `~/.cache/x3` | `%LOCALAPPDATA%\x3\cache` |
 | application log | `~/.local/state/x3/x3.log` | `%LOCALAPPDATA%\x3\state\x3.log` |
 
@@ -305,11 +305,54 @@ It serves your saved address book: `list_devices`, `list_neighbors`,
 what Winbox has no menu for, such as BGP advertisements or one prefix out of a
 full routing table, and prints only menus on a fixed list. `ping_watch` turns a
 few minutes of fast pings into a loss timeline. `diff_config` compares a saved
-export with now, or one router with another. Every tool is read-only on the
-router (`snapshot_config` writes only to this machine), no model-supplied text
-is ever typed at a router's console, and passwords never appear in results.
-Each device gets one session and one console for as long as it is in use, so
-tool calls do not fill the router's log with logins.
+export with now, or one router with another. Every one of these is read-only
+on the router (`snapshot_config` writes only to this machine), no
+model-supplied text is typed at a router's console by them, and passwords never
+appear in results. Each device gets one session and one console for as long as
+it is in use, so tool calls do not fill the router's log with logins.
+
+### Changes an assistant proposes
+
+The server cannot change a router. It can ask you to: `propose_change` opens an
+x3 window of its own with the assistant's reason, the commands exactly as they
+would be typed, and a checklist. Nothing is sent until you press **Approve and
+run**. `change_status` tells the assistant what you decided and how it went.
+
+An approved change runs like this:
+
+1. the checklist once, to see what already fails before anything is touched;
+2. an export, saved with x3's other config snapshots;
+3. Safe Mode, then a timer on the router itself: a scheduler entry that runs
+   `/safe-mode unroll` at a deadline;
+4. the commands, one at a time;
+5. the checklist, each check retried for as long as it was given;
+6. every check passed: the timer is removed and Safe Mode released, so the
+   change is kept. Anything else: it is discarded, and the export compared
+   with the saved one before the window says **Reverted**.
+
+"Anything else" includes a command the console answers at all (a write that
+worked prints nothing), a failed check, **Revert now**, closing the window, and
+losing the connection. The timer is for that last case. Safe Mode by itself
+rolls back when its session drops, but a change that cuts the path to the
+router leaves the session looking alive from the router's side, and the change
+stays held; the timer undoes it at the deadline whoever is still connected. It
+needs version 7.18 or newer, and without it no change is made.
+
+A checklist entry is a ping from the router (`max_loss_pct`) or a count of rows
+in a `console_print` menu (`min`/`max`, with the same conditions), each with an
+optional `within_s`. A command is one `add`, `set`, `remove`, `enable`,
+`disable`, `move`, `unset` or `comment` on a menu, written out in full: no
+scripting, no computed values, one change per line. Users, files, packages,
+certificates, scripts and the scheduler are not changed this way.
+
+The first proposal for a router is flagged as such. **Never for this router**
+rejects it and refuses every later one without showing it. Each change is kept
+as a file under `changes/` in x3's data folder: what was asked, what you
+answered, every step and the result.
+
+This is a guard against a change that breaks something the checklist can see.
+It does not make a change safe that you would not have made yourself: read the
+commands.
 
 ## Development
 

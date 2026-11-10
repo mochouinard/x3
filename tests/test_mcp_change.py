@@ -1,0 +1,660 @@
+"""Changes proposed over MCP: what may be proposed, and what the run does.
+
+No device and no pytest required:
+
+    python tests/test_mcp_change.py
+
+The MCP server never writes. It writes a job file and opens the x3 change
+window, where a person approves; the run then takes Safe Mode, sets a revert
+timer on the router itself, types the commands, runs the checklist and keeps
+the change only if every check passes. These tests are that sentence, one
+clause at a time, against a router that is a few lists in memory:
+
+  * what a command may be: one write verb on a menu, nothing computed;
+  * every way a run ends, and that only one of them keeps the change;
+  * the timer goes on first and comes off last, and a router too old for it
+    is not touched;
+  * a change that cuts its own connection is reverted by the router, and the
+    run says "reverted" only once it has seen the old config again;
+  * the tools refuse a router the user closed, and report what happened;
+  * the window: Enter cannot approve, closing it rejects, closing it
+    mid-change reverts.
+"""
+
+import os
+import sys
+import tempfile
+import threading
+import time
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+_TMP = tempfile.mkdtemp(prefix="x3-test-")
+os.environ["XDG_CONFIG_HOME"] = os.path.join(_TMP, "config")
+os.environ["XDG_DATA_HOME"] = os.path.join(_TMP, "data")
+
+from x3.proto.configexport import ConfigExport  # noqa: E402
+from x3.proto.device import DeviceError  # noqa: E402
+from x3.mcp import change as C  # noqa: E402
+from x3.mcp import tools as T  # noqa: E402
+from x3.mcp.protocol import ToolError  # noqa: E402
+
+failures: list[str] = []
+
+
+def check(label, got, want):
+    if got == want:
+        print(f"ok  {label}")
+    else:
+        failures.append(label)
+        print(f"FAIL {label}\n     got:  {got!r}\n     want: {want!r}")
+
+
+def ok(label, cond, detail=""):
+    if cond:
+        print(f"ok  {label}")
+    else:
+        failures.append(label)
+        print(f"FAIL {label}" + (f"\n     {detail}" if detail else ""))
+
+
+# --- what a command may be -------------------------------------------------------
+
+for good in [
+    "/ip address add address=192.0.2.1/24 interface=ether1 comment=\"a; b\"",
+    "/routing/filter/rule/set [find chain=bgp-out] rule=\"set distance 10; accept\"",
+    "/ip firewall filter remove [find comment~\"^x[0-9]\"]",
+    "/interface bridge port move 3 0",
+    "/ip firewall address-list add list=x address=192.0.2.0/24 comment=\"why\\3F\"",
+]:
+    try:
+        ok(f"a change is accepted: {good[:40]}", C.check_command(good) == good)
+    except ToolError as e:
+        ok(f"a change is accepted: {good[:40]}", False, str(e))
+
+for bad, why in [
+    ("/system reboot", "not a change verb"),
+    ("/ip address print", "a read is not a change"),
+    ("/ip address add address=192.0.2.1/24; /system reboot", "a second command"),
+    ("/ip address add address=[/system reboot]", "a command in brackets"),
+    ("/ip address add address=[find] comment=[/system reboot]", "a command after a find"),
+    ("/ip address add address=[find [find]]", "nested brackets"),
+    ("/ip address add comment=$x", "a variable"),
+    (":put 1", "scripting"),
+    ("/ip address add comment=\"abc", "an unclosed quote"),
+    ("/ip address add comment=\"what?\"", "a ? opens help"),
+    ("/ip route add comment=café", "not ASCII"),
+    ("/ip address add address=192.0.2.1/24\n/system reboot", "a second line"),
+    ("/ip address add a=1 { }", "braces"),
+    ("/user add name=x", "users"),
+    ("/user group set full policy=x", "user groups"),
+    ("/file remove x", "files"),
+    ("/system script add name=x source=y", "scripts"),
+    ("/system scheduler add name=x on-event=y", "the scheduler"),
+    ("/system package enable x", "packages"),
+    ("/certificate remove x", "certificates"),
+    ("/import x.rsc", "import"),
+    ("/tool fetch url=x", "fetch"),
+    ("/system/reset-configuration", "reset"),
+    ("", "empty"),
+]:
+    try:
+        C.check_command(bad)
+        ok(f"refused: {why}", False, bad)
+    except ToolError:
+        ok(f"refused: {why}", True)
+
+ok("/user-manager is not /user", C.check_command("/user-manager user add name=x"))
+
+c = C.check_check({"type": "rows", "menu": "bgp session", "where": ["established"],
+                   "min": 2, "within_s": 120})
+check("a rows check, in words",
+      c["name"], "/routing bgp session: at least 2 row(s) where established, within 120s")
+check("a ping check defaults to no loss of five",
+      C.check_check({"type": "ping", "address": "192.0.2.9"})["name"],
+      "ping 192.0.2.9: at most 0% of 5 lost")
+for bad in [{"type": "script"}, {"type": "ping", "address": "x; y"},
+            {"type": "rows", "menu": "/file"}, {"type": "rows", "menu": "ip route", "where": ["a=$b"]},
+            "ping 1.1.1.1"]:
+    try:
+        C.check_check(bad)
+        ok(f"a check that is not one is refused: {bad}", False)
+    except ToolError:
+        ok(f"a check that is not one is refused: {bad}", True)
+
+
+# --- a router in memory -------------------------------------------------------------
+
+class Router:
+    """Config lines, and Safe Mode as a list of ways back."""
+
+    def __init__(self, version="7.21.1"):
+        self.version = version
+        self.config = ["/ip address add address=10.0.0.1/24 interface=ether1"]
+        self.floating: list = []          # undo closures, oldest first
+        self.safe = False
+        self.typed: list[str] = []
+        self.refuse: dict[str, str] = {}  # command -> what the console says
+        self.unrecorded: set[str] = set()  # commands History says nothing about
+        self.cuts: set[str] = set()       # commands that kill the path
+        self.cut = False
+        self.unreachable_ping: set[str] = set()
+        self.rows: dict[str, int] = {}    # menu -> count
+        self.released = self.unrolled = self.dropped = 0
+        self.opened: list[bool] = []
+
+    def unroll(self):
+        while self.floating:
+            self.floating.pop()()
+        self.safe = False
+
+    def timer_fires(self):
+        """The scheduler entry runs /safe-mode unroll: everything goes back,
+        the timer with it, and the path comes back with the old config."""
+        self.unroll()
+        self.cut = False
+
+
+class Client:
+    def __init__(self, router: Router, write: bool):
+        if router.cut:
+            raise DeviceError("timed out")
+        self.r = router
+        self.write = write
+        self.info = type("I", (), {"version": router.version, "identity": "edge"})()
+        router.opened.append(write)
+
+    def interface_choices(self):
+        return [(1, "ether1", "Ethernet")]
+
+    def _gone(self):
+        if self.r.cut:
+            raise DeviceError("connection lost")
+
+    def export_config(self, *, show_sensitive=True):
+        self._gone()
+        text = "\n".join(self.r.config)
+        return ConfigExport(text=text, body=text, complete=True, command="/export terse")
+
+    def safe_mode_enter(self):
+        self._gone()
+        assert self.write, "Safe Mode taken on a read-only session"
+        self.r.safe = True
+
+    def safe_mode_pending(self):
+        self._gone()
+        return len(self.r.floating)
+
+    def safe_mode_leave(self, *, keep_changes=True):
+        self._gone()
+        if keep_changes:
+            self.r.released += 1
+            self.r.floating.clear()
+            self.r.safe = False
+        else:
+            self.r.unrolled += 1
+            self.r.unroll()
+
+    def drop_session(self):
+        self.r.dropped += 1
+
+    def close(self):
+        # What DeviceClient.close does with Safe Mode still held: releases,
+        # which KEEPS. A run that gets here with changes held has a bug.
+        if self.r.safe and self.r.floating and not self.r.cut:
+            self.r.kept_by_close = True
+
+    def run_console(self, command, *, timeout):
+        self._gone()
+        r = self.r
+        r.typed.append(command)
+
+        def said(text="", complete=True):
+            return ConfigExport(text=text, complete=complete, command=command)
+
+        if command.startswith("/ping"):
+            addr = command.split("address=")[1].split()[0]
+            n = int(command.split("count=")[1].split()[0])
+            got = 0 if addr in r.unreachable_ping else n
+            return said(f"sent={n} received={got} packet-loss={100 - 100 * got // n}%")
+        if " print count-only" in command:
+            return said(str(r.rows.get(command.split(" print")[0], 0)))
+        assert self.write, f"a change typed on a read-only session: {command}"
+        assert r.safe, f"a change typed outside Safe Mode: {command}"
+        if command in r.refuse:
+            return said(r.refuse[command])
+        if command in r.cuts:
+            r.cut = True
+            return said("", complete=False)
+        if command.startswith("/system scheduler remove"):
+            line = next(x for x in r.config if x.startswith("/system scheduler add"))
+            r.config.remove(line)
+            r.floating.append(lambda: r.config.append(line))
+            return said()
+        r.config.append(command)
+        if command not in r.unrecorded:
+            r.floating.append(lambda: r.config.remove(command))
+        return said()
+
+
+ADD = "/ip address add address=192.0.2.1/24 interface=ether2"
+PING = {"type": "ping", "address": "192.0.2.9", "count": 2}
+
+
+def job_for(commands=(ADD,), checks=(PING,), settle=0):
+    return C.new_job(device="edge", host="10.9.9.9", login="admin", summary="test",
+                     commands=[C.check_command(x) for x in commands],
+                     checks=[C.check_check(x) for x in checks], settle_s=settle)
+
+
+def run(router, job=None, *, cancel=None, sleep=None, events=None):
+    job = job or job_for()
+    said = events if events is not None else []
+    result = C.ChangeRun(
+        job, connect=lambda write: Client(router, write), emit=said.append,
+        cancel=cancel, sleep=sleep or (lambda s: None),
+    ).run()
+    return result, [e["step"] for e in said]
+
+
+# --- kept ------------------------------------------------------------------------------
+
+r = Router()
+before = list(r.config)
+res, steps = run(r)
+check("every check passes: kept", res["status"], C.KEPT)
+check("the config is the old one plus the change, and no timer left behind",
+      r.config, before + [ADD])
+check("released once, never discarded", (r.released, r.unrolled, r.dropped), (1, 0, 0))
+writes = [t for t in r.typed if not t.startswith("/ping")]
+ok("the revert timer is the first thing typed under Safe Mode, the removal the last",
+   writes[0].startswith("/system scheduler add name=x3-change-")
+   and 'on-event="/safe-mode unroll"' in writes[0]
+   and writes[1] == ADD and writes[2].startswith("/system scheduler remove [find name=x3-change-"),
+   writes)
+check("the order of the run", [s for i, s in enumerate(steps) if i == 0 or steps[i - 1] != s],
+      ["connect", "baseline", "snapshot", "safe-mode", "timer", "apply", "check", "keep"])
+check("the report carries what the export gained", res["diff"], ["+" + ADD])
+ok("the checklist ran before the change too", res["baseline"] == [
+    {"name": "ping 192.0.2.9: at most 0% of 2 lost", "ok": True, "seen": "2/2 replies (0% lost)"}])
+ok("one write-capable session, no other", r.opened == [True], r.opened)
+
+# --- reverted, every way -------------------------------------------------------------------
+
+r = Router()
+r.unreachable_ping.add("192.0.2.9")
+before = list(r.config)
+res, _ = run(r)
+check("a failed check: reverted", res["status"], C.REVERTED)
+check("and the config is exactly what it was", r.config, before)
+check("discarded, not released", (r.released, r.unrolled), (0, 1))
+ok("the reason names the check", "check failed" in res["why"], res["why"])
+ok("the revert was checked against the snapshot", res["revert"] == {"orderly": True, "verified": "same"})
+
+r = Router()
+second = "/ip address add address=192.0.2.2/24 interface=nosuch"
+r.refuse[second] = "input does not match any value of interface"
+before = list(r.config)
+res, _ = run(r, job_for(commands=(ADD, second)))
+check("a command the console answers: reverted", res["status"], C.REVERTED)
+check("the first command went back with it", r.config, before)
+check("the report says which command and what the console said",
+      res["failed_command"], {"n": 2, "command": second,
+                              "said": "input does not match any value of interface"})
+ok("the checklist is not run on a change that did not apply", res["checks"] == [])
+
+r = Router()
+r.unrecorded.add(ADD)
+res, _ = run(r)
+check("a command History records nothing for: reverted, not trusted", res["status"], C.UNCERTAIN)
+ok("and it says Safe Mode could not vouch for it", "no undoable change" in res["why"], res["why"])
+ok("the leftover is reported as a config that still differs",
+   res["revert"]["verified"] == "differs")
+
+r = Router()
+cancel = threading.Event()
+slept = []
+
+
+def press_revert_while_settling(seconds):
+    slept.append(seconds)
+    cancel.set()
+
+
+before = list(r.config)
+res, _ = run(r, job_for(settle=5), cancel=cancel, sleep=press_revert_while_settling)
+check("Revert pressed while it settles: reverted", res["status"], C.REVERTED)
+check("and the router is as it was", r.config, before)
+ok("within one slice of the wait, not after all of it", len(slept) == 1 and slept[0] <= 0.5, slept)
+
+r = Router()
+cancel = threading.Event()
+cancel.set()
+res, _ = run(r, cancel=cancel)
+check("Revert pressed before Safe Mode: nothing applied", res["status"], C.NOT_APPLIED)
+ok("and nothing typed but the baseline", all(t.startswith("/ping") for t in r.typed), r.typed)
+
+# --- before anything is changed ---------------------------------------------------------------
+
+r = Router(version="7.15.3")
+res, _ = run(r)
+check("a router too old for the timer is not touched", res["status"], C.NOT_APPLIED)
+ok("and is told why", "7.18" in res["why"], res["why"])
+ok("no Safe Mode, no change typed", not r.safe and all(t.startswith("/ping") for t in r.typed))
+
+r = Router()
+r.cut = True
+res, _ = run(r)
+check("cannot connect: nothing applied", res["status"], C.NOT_APPLIED)
+
+r = Router()
+res, _ = run(r, job_for(checks=({"type": "ping", "address": "192.0.2.9", "interface": "ether9"},)))
+check("a check naming an interface the router lacks stops before any change",
+      (res["status"], r.safe, r.config == Router().config), (C.NOT_APPLIED, False, True))
+
+r = Router()
+timer_cmd = None
+
+
+class NoTimer(Client):
+    def run_console(self, command, *, timeout):
+        if command.startswith("/system scheduler add"):
+            self.r.typed.append(command)
+            return ConfigExport(text="failure: not enough permissions", complete=True, command=command)
+        return super().run_console(command, timeout=timeout)
+
+
+said = []
+res = C.ChangeRun(job_for(), connect=lambda w: NoTimer(r, w), emit=said.append,
+                  sleep=lambda s: None).run()
+ok("no timer, no change: the commands are never typed",
+   res["status"] == C.REVERTED and ADD not in r.typed and ADD not in r.config, (res, r.typed))
+
+# --- the change cuts its own path -----------------------------------------------------------------
+
+r = Router()
+r.cuts.add(ADD)
+before = list(r.config)
+naps = []
+
+
+def router_timer_fires_on_third_nap(seconds):
+    naps.append(seconds)
+    if len(naps) == 3:
+        r.timer_fires()
+
+
+res, _ = run(r, sleep=router_timer_fires_on_third_nap)
+check("a change that cuts the connection: reverted, by the router's own timer",
+      res["status"], C.REVERTED)
+check("the session was cut, not released", (r.released, r.dropped >= 1), (0, True))
+check("and the old config was seen again before saying so", r.config, before)
+ok("looked at with a fresh read-only session", r.opened == [True, False], r.opened)
+ok("an orderly discard was not claimed", res["revert"] == {"orderly": False, "verified": "same"})
+ok("close() never ran with changes held", not getattr(r, "kept_by_close", False))
+
+r = Router()
+r.cuts.add(ADD)
+job = job_for()
+res = C.ChangeRun(job, connect=lambda w: Client(r, w), emit=lambda e: None,
+                  sleep=lambda s: None, reconnect_for_s=0.0).run()
+check("never reachable again: not called reverted", res["status"], C.UNCERTAIN)
+ok("and says a person must look", "could not be reached" in res["why"], res["why"])
+
+# --- the timer fired under a run that was still going ----------------------------------------------
+
+r = Router()
+
+
+class TimerFiresDuringChecks(Client):
+    def run_console(self, command, *, timeout):
+        if command.startswith("/ping") and self.r.safe and ADD in self.r.config:
+            self.r.unroll()   # the scheduler ran /safe-mode unroll
+        return super().run_console(command, timeout=timeout) if self.r.safe or command.startswith("/ping") \
+            else ConfigExport(text="", complete=True, command=command)
+
+
+before = list(r.config)
+res = C.ChangeRun(job_for(), connect=lambda w: TimerFiresDuringChecks(r, w),
+                  emit=lambda e: None, sleep=lambda s: None).run()
+ok("the timer fired mid-run: never reported as kept",
+   res["status"] != C.KEPT and r.released == 0, res)
+
+check("the deadline covers what the run may wait for, with a margin",
+      C.deadline_s(job_for(checks=({"type": "ping", "address": "192.0.2.9", "count": 5,
+                                    "within_s": 120},), settle=30)),
+      30 + 8 + (15 + 10 + 120) + C.DEADLINE_MARGIN_S)
+check("and is never shorter than three minutes", C.deadline_s(job_for()), C.DEADLINE_MIN_S)
+
+# --- the job file and the policy -------------------------------------------------------------------
+
+job = job_for()
+C.save(job)
+check("a job reads back as written", C.load(job["id"])["commands"], [ADD])
+ok("a waiting job with a fresh heartbeat is this device's active one",
+   C.active_for("10.9.9.9", "admin")["id"] == job["id"])
+job["beat"] = time.time() - 60
+C.save(job)
+ok("one whose window died is not", C.active_for("10.9.9.9", "admin") is None)
+ok("and its report says the window is gone", "window is gone" in C.report(job))
+try:
+    C.load("../../etc/passwd")
+    ok("a job id is not a path", False)
+except ToolError:
+    ok("a job id is not a path", True)
+
+check("no policy until someone decides", C.policy_for("10.9.9.9", "admin"), "")
+C.set_policy("10.9.9.9", "admin", C.NEVER)
+check("never is remembered, whatever the case", C.policy_for("10.9.9.9", "ADMIN"), C.NEVER)
+check("per login as well as per host", C.policy_for("10.9.9.9", "other"), "")
+
+# --- the tools ---------------------------------------------------------------------------------------
+
+
+class Conn:
+    def __init__(self, host, login="admin"):
+        self.host, self.login = host, login
+
+
+class Book:
+    def devices(self):
+        return []
+
+    def resolve(self, device):
+        return Conn({"edge": "10.9.9.9", "core": "10.8.8.8"}[device])
+
+    def run(self, device, fn):
+        raise AssertionError("propose_change must not open a session")
+
+    def close(self):
+        pass
+
+
+launched: list[str] = []
+box = T.ToolBox(Book(), launch_change=launched.append)
+names = [d["name"] for d, _f in box.definitions()]
+ok("the change tools are offered when there is a window to approve in",
+   names[-2:] == ["propose_change", "change_status"])
+ok("and not otherwise", "propose_change" not in [d["name"] for d, _f in T.ToolBox(Book()).definitions()])
+
+ask = {"device": "core", "summary": "why", "commands": [ADD], "checks": [PING]}
+try:
+    box.propose_change({**ask, "device": "edge"})
+    ok("a router the user closed is refused without a window", False)
+except ToolError as e:
+    ok("a router the user closed is refused without a window",
+       "closed" in str(e) and launched == [], str(e))
+for missing, label in [("summary", "a summary"), ("commands", "commands"), ("checks", "a checklist")]:
+    try:
+        box.propose_change({k: v for k, v in ask.items() if k != missing})
+        ok(f"a proposal needs {label}", False)
+    except ToolError:
+        ok(f"a proposal needs {label}", launched == [])
+try:
+    box.propose_change({**ask, "commands": [ADD, "/system reboot"]})
+    ok("one bad command refuses the whole proposal", False)
+except ToolError:
+    ok("one bad command refuses the whole proposal", launched == [])
+
+said = box.propose_change(ask)
+job_id = launched[0]
+ok("a good proposal opens the window and says nothing was sent",
+   job_id in said and "Nothing has been sent" in said, said)
+check("the job waits, with the commands as they will be typed",
+      (C.load(job_id)["status"], C.load(job_id)["commands"]), (C.WAITING, [ADD]))
+try:
+    box.propose_change(ask)
+    ok("one change at a time per router", False)
+except ToolError as e:
+    ok("one change at a time per router", job_id in str(e), str(e))
+ok("change_status: waiting on the user", "waiting for the user" in box.change_status({"id": job_id}))
+
+job = C.load(job_id)
+job["status"], job["note"] = C.REJECTED, "not during business hours"
+job["result"] = {"status": C.REJECTED, "why": "The user rejected."}
+C.save(job)
+status = box.change_status({"id": job_id})
+ok("a rejection comes back with the user's note",
+   "REJECTED" in status and "not during business hours" in status, status)
+
+
+def no_window(job_id):
+    raise ToolError("there is no desktop session here to show it on")
+
+
+try:
+    T.ToolBox(Book(), launch_change=no_window).propose_change(ask)
+    ok("no desktop: the proposal fails and says so", False)
+except ToolError as e:
+    ok("no desktop: the proposal fails and says so", "could not be opened" in str(e))
+ok("and leaves no job waiting", C.active_for("10.8.8.8", "admin") is None)
+
+# --- the window ------------------------------------------------------------------------------------------
+
+from PySide6.QtCore import QEventLoop, QTimer  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+from x3.ui.widgets import change_window as W  # noqa: E402
+
+app = QApplication.instance() or QApplication([])
+W.ARM_AFTER_MS = 50
+
+
+def spin(ms):
+    loop = QEventLoop()
+    QTimer.singleShot(ms, loop.quit)
+    loop.exec()
+
+
+def until(cond, ms=5000):
+    end = time.monotonic() + ms / 1000
+    while not cond() and time.monotonic() < end:
+        spin(20)
+    return cond()
+
+
+def window_for(router, job=None, first_time=True):
+    job = job or job_for()
+    job["host"] = f"10.7.7.{len(launched) + window_for.n}"
+    window_for.n += 1
+    C.save(job)
+    win = W.ChangeWindow(
+        job, first_time=first_time,
+        make_run=lambda j, emit, cancel: C.ChangeRun(
+            j, connect=lambda w: Client(router, w), emit=emit, cancel=cancel,
+            sleep=lambda s: time.sleep(min(s, 0.01))),
+    )
+    win.show()
+    return win, job
+
+
+window_for.n = 0
+
+r = Router()
+win, job = window_for(r)
+ok("the buttons are dead when the window appears",
+   not win.approve_btn.isEnabled() and not win.reject_btn.isEnabled())
+ok("the commands are shown as they will be typed", ADD in win.commands.toPlainText())
+spin(120)
+ok("and live a moment later", win.approve_btn.isEnabled())
+ok("Enter is Reject, never Approve",
+   win.reject_btn.isDefault() and not win.approve_btn.isDefault() and not win.approve_btn.autoDefault())
+win.note.setText("go ahead")
+win.approve_btn.click()
+ok("approved: the run ends kept", until(lambda: win.job["status"] in C.FINAL)
+   and win.job["status"] == C.KEPT, win.job["status"])
+on_disk = C.load(job["id"])
+ok("the job file has the result, the note and the steps",
+   on_disk["status"] == C.KEPT and on_disk["note"] == "go ahead"
+   and any(e["step"] == "timer" for e in on_disk["events"]), on_disk)
+ok("Revert is dead once it is kept, Close is live",
+   not win.revert_btn.isEnabled() and win.close_btn.isEnabled())
+check("approving once does not open the router for good", C.policy_for(job["host"], "admin"), "")
+win.close()
+
+r = Router()
+win, job = window_for(r)
+spin(120)
+win.remember.setChecked(True)
+win.approve_btn.click()
+until(lambda: win.job["status"] in C.FINAL)
+check("ticking the box stops the first-time flag", C.policy_for(job["host"], "admin"), C.ALWAYS)
+win.close()
+
+r = Router()
+win, job = window_for(r)
+spin(120)
+win.note.setText("wrong router")
+win.reject_btn.click()
+on_disk = C.load(job["id"])
+check("rejected: written, with the note, and nothing typed",
+      (on_disk["status"], on_disk["note"], r.typed), (C.REJECTED, "wrong router", []))
+
+r = Router()
+win, job = window_for(r)
+spin(120)
+win.never_btn.click()
+check("Never: rejected, and the router closed to proposals",
+      (C.load(job["id"])["status"], C.policy_for(job["host"], "admin")), (C.REJECTED, C.NEVER))
+
+r = Router()
+win, job = window_for(r)
+win.close()
+check("closing the window without deciding rejects",
+      (C.load(job["id"])["status"], r.typed), (C.REJECTED, []))
+
+r = Router()
+gate = threading.Event()
+
+
+class Slow(Client):
+    def run_console(self, command, *, timeout):
+        if command == ADD:
+            got = super().run_console(command, timeout=timeout)
+            gate.wait(5)    # the change is in; the run is now mid-flight
+            return got
+        return super().run_console(command, timeout=timeout)
+
+
+job = job_for(settle=30)
+job["host"] = "10.7.7.200"
+C.save(job)
+before = list(r.config)
+win = W.ChangeWindow(job, first_time=False, make_run=lambda j, emit, cancel: C.ChangeRun(
+    j, connect=lambda w: Slow(r, w), emit=emit, cancel=cancel))
+win.show()
+spin(120)
+win.approve_btn.click()
+until(lambda: ADD in r.config)
+win.close()                      # the person closes the window mid-change
+ok("closing mid-change does not close: it reverts first", win.isVisible() and win.job["status"] == C.RUNNING)
+gate.set()
+ok("and then the window goes", until(lambda: not win.isVisible()))
+check("with the router as it was", (C.load(job["id"])["status"], r.config), (C.REVERTED, before))
+
+print()
+if failures:
+    print(f"{len(failures)} failure(s)")
+    for f in failures:
+        print(" -", f)
+    sys.exit(1)
+print("all change checks passed")

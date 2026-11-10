@@ -26,6 +26,7 @@ from x3.proto.device import DeviceClient, DeviceError
 
 from ..ui import connstore as cs
 from ..ui.services import discover_neighbors, load_address_book, split_host_port
+from . import change as chg
 from . import diag
 from .protocol import ToolError
 
@@ -40,7 +41,11 @@ INSTRUCTIONS = (
     "advertisements, or one prefix out of a large routing table. "
     "on_devices runs one tool on several devices; snapshot_config and "
     "diff_config compare configs over time or between routers. "
-    "Everything is read-only: this server cannot change a router. "
+    "Everything is read-only: this server cannot change a router by itself. "
+    "propose_change only asks: the change opens in an x3 window where the "
+    "user reads the exact commands and approves or rejects; approved, it "
+    "runs under Safe Mode with a revert timer on the router, and is kept "
+    "only if your checklist passes. change_status tells you how it went. "
     "Secrets come back as <hidden>."
 )
 
@@ -342,11 +347,110 @@ def _cell(text: str) -> str:
 class ToolBox:
     """The tool set, bound to one device source."""
 
-    def __init__(self, source: DeviceSource) -> None:
+    def __init__(self, source: DeviceSource, *,
+                 launch_change: Callable[[str], None] | None = None) -> None:
         self.source = source
         self._menus: dict[str, list[MenuRef]] = {}
+        #: Opens the x3 change window for a job id. Without one (no window to
+        #: approve in), the change tools are not offered at all.
+        self._launch_change = launch_change
 
     def definitions(self) -> list[tuple[dict[str, Any], Callable[[dict[str, Any]], str]]]:
+        defs = self._read_definitions()
+        if self._launch_change is not None and hasattr(self.source, "resolve"):
+            defs += self._change_definitions()
+        return defs
+
+    def _change_definitions(self) -> list[tuple[dict[str, Any], Callable[[dict[str, Any]], str]]]:
+        device = {"type": "string", "description": "A name from list_devices."}
+        check = {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "enum": ["ping", "rows"]},
+                "name": {"type": "string", "description": "What this check proves, in a few words."},
+                "within_s": {"type": "integer", "minimum": 0, "maximum": chg.MAX_WITHIN_S,
+                             "description": "Keep trying this long before it counts "
+                                            "as failed, e.g. 120 for a BGP session "
+                                            "that has to come back. Default 0: one try."},
+                "address": {"type": "string", "description": "ping: what to ping from the router."},
+                "count": {"type": "integer", "minimum": 1, "maximum": 50},
+                "max_loss_pct": {"type": "integer", "minimum": 0, "maximum": 99,
+                                 "description": "ping: most loss that still passes. Default 0."},
+                "src_address": {"type": "string"},
+                "routing_table": {"type": "string"},
+                "interface": {"type": "string"},
+                "menu": {"type": "string",
+                         "description": "rows: a console_print menu, e.g. "
+                                        "'/routing bgp session'."},
+                "where": {"type": "array", "items": {"type": "string"},
+                          "description": "rows: console_print conditions, e.g. "
+                                         "['name=upstream-1', 'established']."},
+                "min": {"type": "integer", "minimum": 0,
+                        "description": "rows: fewest matching rows that pass. "
+                                       "Default 1 when max is not given."},
+                "max": {"type": "integer", "minimum": 0,
+                        "description": "rows: most matching rows that pass; 0 "
+                                       "proves something is gone."},
+            },
+            "required": ["type"],
+        }
+        return [
+            ({
+                "name": "propose_change",
+                "description": "Ask the user to approve a configuration change "
+                               "on one device. This does not change anything: it "
+                               "opens an x3 window showing the user your summary, "
+                               "the exact commands and the checklist. If they "
+                               "approve, x3 saves the config, takes Safe Mode, "
+                               "sets a revert timer on the router, types the "
+                               "commands, then runs the checklist: all pass and "
+                               "the change is kept, anything else and it is "
+                               "reverted. Returns a change id at once; follow it "
+                               "with change_status. Commands are full-path "
+                               f"{'/'.join(sorted(chg.WRITE_VERBS))} lines, one "
+                               "change each, no scripting; a '?' is written \\3F. "
+                               "Users, files, packages, certificates, scripts and "
+                               "the scheduler are not changed this way. Write the "
+                               "checklist to prove the change worked AND that "
+                               "nothing else broke (the upstream still pings, the "
+                               "BGP sessions are still established).",
+                "inputSchema": {"type": "object", "properties": {
+                    "device": device,
+                    "summary": {"type": "string",
+                                "description": "What the change is for, for the "
+                                               "person approving it. Plain words."},
+                    "commands": {"type": "array", "items": {"type": "string"},
+                                 "minItems": 1, "maxItems": chg.MAX_COMMANDS,
+                                 "description": "Typed in this order, e.g. "
+                                                "'/routing filter rule set [find "
+                                                "chain=bgp-out] disabled=yes'."},
+                    "checks": {"type": "array", "items": check,
+                               "minItems": 1, "maxItems": chg.MAX_CHECKS},
+                    "settle_s": {"type": "integer", "minimum": 0, "maximum": chg.MAX_SETTLE_S,
+                                 "description": "Wait this long after the commands "
+                                                "before the checklist. Default 5."},
+                }, "required": ["device", "summary", "commands", "checks"]},
+                "annotations": {"readOnlyHint": False, "destructiveHint": True,
+                                "idempotentHint": False, "openWorldHint": True},
+            }, self.propose_change),
+            ({
+                "name": "change_status",
+                "description": "Where a proposed change stands: waiting for the "
+                               "user, rejected (with their note), running, kept, "
+                               "reverted, or not confirmed; with the checklist "
+                               "results before and after, and what changed in "
+                               "the export.",
+                "inputSchema": {"type": "object", "properties": {
+                    "id": {"type": "string", "description": "From propose_change."},
+                    "wait_s": {"type": "integer", "minimum": 0, "maximum": 55,
+                               "description": "Wait up to this long for the next "
+                                              "step instead of answering at once."},
+                }, "required": ["id"]},
+                "annotations": {"readOnlyHint": True},
+            }, self.change_status),
+        ]
+
+    def _read_definitions(self) -> list[tuple[dict[str, Any], Callable[[dict[str, Any]], str]]]:
         ro = {"readOnlyHint": True, "openWorldHint": True}
         device = {"type": "string", "description": "A name from list_devices."}
         return [
@@ -1038,6 +1142,73 @@ class ToolBox:
                 got = f"error: {e}"
             out.append(f"=== {name}\n{got}")
         return "\n\n".join(out)
+
+    # --- changes: proposed here, approved and run in the x3 change window ----------
+
+    def propose_change(self, args: dict[str, Any]) -> str:
+        device = _device(args)
+        conn = self.source.resolve(device)
+        if chg.policy_for(conn.host, conn.login) == chg.NEVER:
+            raise ToolError(
+                f"The user has closed {device} to proposed changes. Do not propose "
+                "again for this router; tell them what you would have changed."
+            )
+        summary = " ".join(str(args.get("summary") or "").split())
+        if not summary:
+            raise ToolError("summary is required: what the change is for, in plain words.")
+        commands = args.get("commands") or []
+        if isinstance(commands, str):
+            commands = [commands]
+        if not 1 <= len(commands) <= chg.MAX_COMMANDS:
+            raise ToolError(f"commands: between 1 and {chg.MAX_COMMANDS} lines.")
+        checks = args.get("checks") or []
+        if not isinstance(checks, list) or not 1 <= len(checks) <= chg.MAX_CHECKS:
+            raise ToolError(
+                "checks: at least one. A change is kept only if its checklist "
+                "passes, so say what must still work afterwards."
+            )
+        job = chg.new_job(
+            device=device, host=conn.host, login=conn.login, summary=summary[:600],
+            commands=[chg.check_command(c) for c in commands],
+            checks=[chg.check_check(c) for c in checks],
+            settle_s=diag.number(args.get("settle_s"), "settle_s", 0, chg.MAX_SETTLE_S, 5),
+        )
+        busy = chg.active_for(conn.host, conn.login)
+        if busy is not None:
+            raise ToolError(
+                f"Change {busy['id']} for {device} is still {busy['status']}. One at "
+                "a time per router: see change_status."
+            )
+        chg.save(job)
+        try:
+            self._launch_change(job["id"])
+        except (OSError, ToolError) as e:
+            job["status"] = chg.NOT_APPLIED
+            job["result"] = {"status": chg.NOT_APPLIED,
+                             "why": f"The x3 change window could not be opened: {e}"}
+            chg.save(job)
+            raise ToolError(f"The x3 change window could not be opened: {e}") from None
+        return (
+            f"Change {job['id']} for {device} is now in front of the user in an x3 "
+            "window. Nothing has been sent to the router. Call change_status with "
+            f"id {job['id']} (wait_s up to 55) to learn their decision and the "
+            f"result. If approved, the run takes up to {chg.deadline_s(job)}s."
+        )
+
+    def change_status(self, args: dict[str, Any]) -> str:
+        job_id = str(args.get("id") or "").strip()
+        wait = diag.number(args.get("wait_s"), "wait_s", 0, 55, 0)
+        job = chg.load(job_id)
+        seen = (job.get("status"), len(job.get("events") or []))
+        end = time.monotonic() + wait
+        while (job.get("status") not in chg.FINAL and not chg.abandoned(job)
+               and time.monotonic() < end):
+            time.sleep(0.5)
+            job = chg.load(job_id)
+            if (job.get("status"), len(job.get("events") or [])) != seen \
+                    and job.get("status") != chg.RUNNING:
+                break
+        return chg.report(job)
 
     def _snapshot_dirs(self, device: str) -> tuple[str, list[Path]]:
         """Where this device's snapshots live, found by its address: the
